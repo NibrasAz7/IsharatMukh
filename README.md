@@ -32,16 +32,10 @@ pip install -r requirements.txt
 > pip install muselsl --no-build-isolation
 > ```
 
-### 2. Set up BlueMuse (Windows Bluetooth)
+### 2. Turn on your Muse S
 
-BlueMuse is a free app that handles Bluetooth Low Energy (BLE) pairing on Windows more reliably than the built-in driver.
-
-1. Download from: https://github.com/kowalej/BlueMuse/releases
-2. Install and launch **BlueMuse**
-3. Turn on your Muse S headband
-4. In BlueMuse: click **Start All Streams** — you should see your headband appear
-
-> If you skip BlueMuse, you can also try: `muselsl stream` in a terminal first.
+Press the power button on your Muse S headband. Make sure your PC Bluetooth is **on**.
+No external app (BlueMuse, muselsl CLI) is needed — the dashboard connects directly.
 
 ### 3. Run the dashboard
 
@@ -51,11 +45,15 @@ python app.py
 
 Open your browser at **http://localhost:8050**
 
-### 4. Connect
+### 4. Scan and Connect (inside the dashboard)
 
-- Click **▶ Connect to Muse** in the sidebar
-- The badge will change from `DEMO` → `LIVE` if the stream is found
-- If no stream is detected, it falls back to **DEMO mode** (synthetic EEG)
+1. Click **🔍 Scan for Muse** in the sidebar — waits ~10 s for BLE discovery
+2. Your headband appears in the **device dropdown** (e.g. `MuseS-1234  (AA:BB:CC:DD:EE:FF)`)
+3. Select it and click **▶ Connect**
+4. The badge changes: `DEMO` → `● LIVE` when BLE is established
+
+> If no device is found after scanning, try moving the headband closer and scan again.
+> If BLE still fails, the dashboard falls back to **DEMO mode** (synthetic EEG so the UI can be explored).
 
 ---
 
@@ -113,11 +111,26 @@ muse_eeg_dashboard/
 ├── requirements.txt
 ├── README.md
 ├── src/
-│   ├── stream_reader.py    # LSL inlet in background thread → circular buffer
-│   ├── processing.py       # Filters, band powers, mental metrics
+│   ├── stream_reader.py    # Direct BLE via muselsl+bleak, circular buffer, demo fallback
+│   ├── processing.py       # Bandpass/notch filters, band powers, mental metrics
 │   ├── data_manager.py     # CSV + EDF file saving
-│   └── layout.py           # Dash UI layout
+│   └── layout.py           # Dash UI layout (3 tabs + sidebar)
 └── data/                   # Auto-created; recordings saved here
+```
+
+## How the BLE Connection Works
+
+```
+[Muse S headset]
+      │  Bluetooth Low Energy
+      ▼
+[muselsl.Muse (bleak backend)]  ←  pure Python, no external app needed
+      │  callback_eeg(data, timestamps)
+      ▼
+[StreamReader circular buffer]  ←  thread-safe deque, 60 s history
+      │  get_window(seconds)
+      ▼
+[Dash dashboard @ localhost:8050]
 ```
 
 ---
@@ -126,8 +139,9 @@ muse_eeg_dashboard/
 
 | Problem | Solution |
 |---|---|
-| "No stream found" | Ensure BlueMuse shows your Muse and has "Streams Started" |
-| Badge stays DEMO | Check BlueMuse is running before clicking Connect |
+| Scan finds nothing | Move Muse closer; make sure it is powered on (LED blinking); try scanning again |
+| Badge stays DEMO | BLE connect failed — check Windows Bluetooth is on; move headband closer |
+| BLE errors on Windows | Ensure no other app (e.g. Mind Monitor on phone) is connected to the same headband |
 | Data not saving | Ensure `data/` folder is writable; check terminal for errors |
-| Notch noise visible | Switch notch filter to match your country's powerline frequency |
-| High "poor" quality | Adjust headband placement; ensure forehead and ear electrodes have contact |
+| Notch noise visible | Switch notch filter to match your country’s powerline frequency |
+| High "poor" quality | Adjust headband; ensure forehead (AF7/AF8) and ear (TP9/TP10) electrodes have good skin contact |

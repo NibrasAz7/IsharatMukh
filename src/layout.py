@@ -59,9 +59,27 @@ def _sidebar() -> dbc.Col:
         dbc.Card([
             dbc.CardHeader("⚙️ Controls", className="fw-bold"),
             dbc.CardBody([
+                # ── Device discovery ──────────────────────────────
+                html.P("Muse Device", className="mb-1 text-muted small fw-bold"),
+                dbc.Button(
+                    "🔍 Scan for Muse",
+                    id="btn-scan",
+                    color="info",
+                    outline=True,
+                    className="w-100 mb-2",
+                    size="sm",
+                ),
+                html.Div(id="scan-status", className="text-info small mb-2"),
+                dcc.Dropdown(
+                    id="device-dropdown",
+                    options=[],
+                    placeholder="Select device…",
+                    className="mb-2",
+                    style={"fontSize": "12px"},
+                ),
                 # Stream toggle
                 dbc.Button(
-                    "▶ Connect to Muse",
+                    "▶ Connect",
                     id="btn-stream-toggle",
                     color="success",
                     className="w-100 mb-3",
@@ -124,6 +142,10 @@ def _sidebar() -> dbc.Col:
         dcc.Store(id="store-recording-active", data=False),
         dcc.Store(id="store-record-start",     data=None),
         dcc.Store(id="store-notch",            data=50),
+        dcc.Store(id="store-devices",          data=[]),
+        dcc.Store(id="store-scan-done",        data=0),
+        # Polling interval for scan results
+        dcc.Interval(id="interval-scan-poll", interval=500, n_intervals=0, disabled=True),
 
         # Update interval
         dcc.Interval(id="interval-update", interval=200, n_intervals=0, disabled=True),

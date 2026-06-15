@@ -201,6 +201,45 @@ def _metric_history_fig(metric: str, color: str, title: str) -> go.Figure:
     return fig
 
 
+# ── Callback: scan for BLE devices ──────────────────────────────────────────────
+
+@app.callback(
+    Output("scan-status",        "children"),
+    Output("btn-scan",           "disabled"),
+    Output("interval-scan-poll", "disabled"),
+    Input("btn-scan",            "n_clicks"),
+    State("store-stream-active", "data"),
+    prevent_initial_call=True,
+)
+def start_scan(n_clicks, stream_active):
+    if stream_active:
+        return "Disconnect first.", False, True
+    _reader.scan_devices()   # non-blocking background thread
+    return "🔍 Scanning (10s)…", True, False
+
+
+@app.callback(
+    Output("device-dropdown",    "options"),
+    Output("device-dropdown",    "value"),
+    Output("scan-status",        "children", allow_duplicate=True),
+    Output("btn-scan",           "disabled", allow_duplicate=True),
+    Output("interval-scan-poll", "disabled", allow_duplicate=True),
+    Input("interval-scan-poll",  "n_intervals"),
+    prevent_initial_call=True,
+)
+def poll_scan_results(n):
+    if _reader.is_scanning:
+        return no_update, no_update, no_update, no_update, no_update
+    devices = _reader.discovered_devices
+    if not devices:
+        return [], None, "⚠ No Muse found. Try again.", False, True
+    options = [
+        {"label": f"{d['name']}  ({d['address']})", "value": d["address"]}
+        for d in devices
+    ]
+    return options, options[0]["value"], f"✓ {len(devices)} device(s) found", False, True
+
+
 # ── Callback: stream toggle ───────────────────────────────────────────────────────
 
 @app.callback(
@@ -213,19 +252,22 @@ def _metric_history_fig(metric: str, color: str, title: str) -> go.Figure:
     Output("store-stream-active", "data"),
     Input("btn-stream-toggle",   "n_clicks"),
     State("store-stream-active", "data"),
+    State("device-dropdown",     "value"),
     prevent_initial_call=True,
 )
-def toggle_stream(n_clicks, is_active):
+def toggle_stream(n_clicks, is_active, selected_address):
     if not is_active:
-        connected = _reader.start(timeout=8.0)
+        _reader.start(address=selected_address or None)
         if _reader.is_demo:
             badge_text, badge_color = "● DEMO", "warning"
+            label = "⏹ Disconnect (demo)"
         else:
             badge_text, badge_color = "● LIVE", "success"
-        return "⏹ Disconnect", "danger", badge_text, badge_color, False, False, True
+            label = f"⏹ Disconnect ({_reader.device_name})"
+        return label, "danger", badge_text, badge_color, False, False, True
     else:
         _reader.stop()
-        return "▶ Connect to Muse", "success", "● OFFLINE", "secondary", True, True, False
+        return "▶ Connect", "success", "● OFFLINE", "secondary", True, True, False
 
 
 # ── Callback: notch filter change ────────────────────────────────────────────────
