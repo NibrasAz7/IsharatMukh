@@ -5,10 +5,9 @@
 muselsl>=2.2.1
 pylsl>=1.16.1
 
-# Dashboard
-dash>=2.17.0
-dash-bootstrap-components>=1.6.0
-plotly>=5.22.0
+# Desktop GUI
+PyQt6>=6.7.0
+pyqtgraph>=0.13.7
 
 # Signal processing
 scipy>=1.13.0
