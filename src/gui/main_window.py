@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 from src.gui.bands_panel import BandsPanel
 from src.gui.eeg_panel import EEGPanel
 from src.gui.mental_panel import MentalPanel
+from src.gui.ppg_panel import PPGPanel, compute_hr_hrv
 from src.gui.theme import (
     CH_NAMES, ERASER_WIDTH, QUALITY_COLORS, SWEEP_SIZE,
 )
@@ -28,7 +29,8 @@ _N_CH = 5
 
 class MainWindow(QMainWindow):
 
-    _scan_done = pyqtSignal(list)   # emitted from BLE thread, handled in main thread
+    _scan_done      = pyqtSignal(list)         # BLE scan results
+    _connect_result = pyqtSignal(bool, str)    # (success, error_msg) from BLE thread
 
     def __init__(self):
         super().__init__()
@@ -52,7 +54,12 @@ class MainWindow(QMainWindow):
         self._is_recording  = False
         self._record_start  = 0.0
 
+        # ── PPG state ─────────────────────────────────────────────────────────
+        self._ppg_last_seen = 0
+        self._stream_start  = 0.0    # used for relative time in HR/HRV history
+
         self._scan_done.connect(self._apply_scan_results)
+        self._connect_result.connect(self._on_connect_result)
         self._build_ui()
         self._build_timers()
 
@@ -75,9 +82,11 @@ class MainWindow(QMainWindow):
         self._eeg_panel    = EEGPanel()
         self._bands_panel  = BandsPanel()
         self._mental_panel = MentalPanel()
+        self._ppg_panel    = PPGPanel()
         self._tabs.addTab(self._eeg_panel,    "📈  Raw EEG")
         self._tabs.addTab(self._bands_panel,  "🌊  EEG Bands")
         self._tabs.addTab(self._mental_panel, "🧠  Mental State")
+        self._tabs.addTab(self._ppg_panel,    "💓  PPG")
         splitter.addWidget(self._tabs)
 
         splitter.setSizes([220, 1180])
@@ -86,7 +95,8 @@ class MainWindow(QMainWindow):
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
-        sidebar.setFixedWidth(220)
+        sidebar.setMinimumWidth(160)
+        sidebar.setMaximumWidth(340)
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
@@ -155,6 +165,12 @@ class MainWindow(QMainWindow):
         self._btn_save.clicked.connect(self._on_save)
         rec_layout.addWidget(self._btn_save)
 
+        self._btn_clear = QPushButton("🗑️  Clear Data")
+        self._btn_clear.setEnabled(False)
+        self._btn_clear.setToolTip("Delete all buffered EEG/PPG data and restart sweep")
+        self._btn_clear.clicked.connect(self._on_clear_data)
+        rec_layout.addWidget(self._btn_clear)
+
         self._save_status = QLabel("")
         self._save_status.setStyleSheet("color: #88ff88; font-size: 11px;")
         self._save_status.setWordWrap(True)
@@ -192,6 +208,10 @@ class MainWindow(QMainWindow):
         self._timer_slow = QTimer(self)
         self._timer_slow.setInterval(2000)
         self._timer_slow.timeout.connect(self._update_slow)
+
+        self._timer_ppg = QTimer(self)
+        self._timer_ppg.setInterval(100)
+        self._timer_ppg.timeout.connect(self._update_ppg)
 
         self._timer_rec = QTimer(self)
         self._timer_rec.setInterval(1000)
@@ -264,10 +284,12 @@ class MainWindow(QMainWindow):
             b: float(np.mean(powers[b][[1, 2]]))
             for b in ("theta", "alpha", "beta")
         }
-        metrics = self._processor.compute_metrics_from_powers(frontal, now)
+        metrics = self._processor.compute_metrics_from_powers(frontal, now,
+                                                               ch_powers=powers)
 
         self._bands_panel.refresh(powers, self._band_history)
         self._mental_panel.refresh(metrics, self._processor)
+        self._update_ppg_metrics()
 
     # ═════════════════════════════════════════════════════════════════════════
     # Sidebar slots
@@ -299,25 +321,36 @@ class MainWindow(QMainWindow):
             address = self._device_combo.currentData()
             self._btn_connect.setEnabled(False)
             self._btn_connect.setText("Connecting…")
-            # Connect in background; use a one-shot timer to poll
-            self._reader.start(address=address or None)
-            if self._reader.is_connected:
-                self._on_connected()
-            else:
-                err = self._reader.last_error or "BLE connection failed"
-                self._btn_connect.setEnabled(True)
-                self._btn_connect.setText("▶  Connect")
-                self._set_status(f"● ERR: {err[:30]}", "#cc3333")
+            self._set_status("● Connecting…", "#f1a24e")
+            # Non-blocking: _on_connect_result is called from background thread
+            # which emits _connect_result signal (cross-thread safe)
+            self._reader.start_async(
+                address=address or None,
+                on_result=lambda ok, err: self._connect_result.emit(ok, err),
+            )
         else:
             self._reader.stop()
             self._on_disconnected()
+
+    def _on_connect_result(self, success: bool, error: str):
+        """Slot called on main thread when BLE connect attempt finishes."""
+        if success:
+            self._on_connected()
+        else:
+            err = error or "BLE connection failed"
+            self._btn_connect.setEnabled(True)
+            self._btn_connect.setText("▶  Connect")
+            self._set_status(f"● ERR: {err[:30]}", "#cc3333")
 
     def _on_connected(self):
         # Reset sweep state
         self._y_sweep[:] = np.nan
         self._write_idx  = 0
         self._last_seen  = self._reader.sample_count
+        self._ppg_last_seen = self._reader.ppg_count
+        self._stream_start  = time.time()
         self._filter_states = self._processor.make_filter_states(_N_CH)
+        self._processor.reset_baseline()
 
         name = self._reader.device_name or "Muse"
         self._btn_connect.setText(f"⏹  Disconnect ({name})")
@@ -327,18 +360,22 @@ class MainWindow(QMainWindow):
         self._btn_connect.style().polish(self._btn_connect)
         self._set_status("● LIVE", "#22cc66")
         self._btn_record.setEnabled(True)
+        self._btn_clear.setEnabled(True)
 
         self._timer_fast.start()
         self._timer_slow.start()
+        self._timer_ppg.start()
 
     def _on_disconnected(self):
         self._timer_fast.stop()
         self._timer_slow.stop()
+        self._timer_ppg.stop()
         self._timer_rec.stop()
         self._is_recording = False
         self._btn_record.setText("⏺  Start Recording")
         self._btn_record.setProperty("recording", "false")
         self._btn_record.setEnabled(False)
+        self._btn_clear.setEnabled(False)
         self._btn_connect.setText("▶  Connect")
         self._btn_connect.setProperty("active", "false")
         self._btn_connect.setEnabled(True)
@@ -346,6 +383,7 @@ class MainWindow(QMainWindow):
         self._btn_connect.style().polish(self._btn_connect)
         self._set_status("● OFFLINE", QUALITY_COLORS["secondary"])
         self._eeg_panel.reset()
+        self._ppg_panel.reset()
 
     def _on_record_toggle(self):
         if not self._is_recording:
@@ -373,12 +411,27 @@ class MainWindow(QMainWindow):
             self._save_status.setText("⚠ No data to save.")
             return
         metric_h = {
-            "workload": list(self._processor.metric_history["workload"]),
-            "fatigue":  list(self._processor.metric_history["fatigue"]),
+            k: list(v)
+            for k, v in self._processor.metric_history.items()
         }
         save_recording(ts, data, sample_rate=self._reader.sample_rate,
                        metric_history=metric_h)
         self._save_status.setText(f"✓ Saved ({data.shape[0]} samples)")
+
+    def _on_clear_data(self):
+        """Delete all buffered EEG/PPG data and restart the sweep."""
+        self._reader.clear()
+        self._processor.reset_baseline()
+        self._y_sweep[:] = np.nan
+        self._write_idx  = 0
+        self._last_seen  = 0
+        self._ppg_last_seen = 0
+        self._stream_start  = time.time()
+        self._filter_states = self._processor.make_filter_states(_N_CH)
+        self._band_history  = {b: deque(maxlen=3600) for b in BANDS}
+        self._eeg_panel.reset()
+        self._ppg_panel.reset()
+        self._save_status.setText("Data cleared.")
 
     def _on_notch_change(self, index: int):
         freq = 50.0 if index == 0 else 60.0
@@ -402,9 +455,33 @@ class MainWindow(QMainWindow):
 
     # ── Clean shutdown ────────────────────────────────────────────────────────
 
+    # ── PPG fast update ───────────────────────────────────────────────────────
+
+    def _update_ppg(self):
+        try:
+            new_ppg, _ = self._reader.get_new_ppg_samples(self._ppg_last_seen)
+            self._ppg_last_seen += new_ppg.shape[0]
+            ppg_win, _ = self._reader.get_ppg_window(seconds=10)
+            self._ppg_panel.refresh_sweep(ppg_win)
+        except Exception:
+            traceback.print_exc()
+
+    def _update_ppg_metrics(self):
+        """Called from _update_slow to compute HR/HRV from PPG window."""
+        try:
+            ppg_win, _ = self._reader.get_ppg_window(seconds=30)
+            if ppg_win.shape[0] < 64 * 5:
+                return
+            hr, hrv = compute_hr_hrv(ppg_win[:, 1], fs=self._reader.ppg_sample_rate)
+            t_rel = time.time() - self._stream_start
+            self._ppg_panel.refresh_metrics(hr, hrv, t_rel)
+        except Exception:
+            traceback.print_exc()
+
     def closeEvent(self, event):
         self._timer_fast.stop()
         self._timer_slow.stop()
+        self._timer_ppg.stop()
         self._timer_rec.stop()
         if self._reader.is_connected:
             self._reader.stop()

@@ -5,9 +5,9 @@ Raw EEG sweep panel — ECG-style left→right scrolling display.
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+    QCheckBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
 from src.gui.theme import (
@@ -26,6 +26,11 @@ class EEGPanel(QWidget):
         super().__init__(parent)
         self._x_arr = np.linspace(0, SWEEP_WINDOW_S, SWEEP_SIZE)
         self._nan_y = np.full(SWEEP_SIZE, np.nan)
+        self._sim_phase  = 0.0      # simulation phase accumulator
+        self._sim_active = False
+        self._sim_timer  = QTimer(self)
+        self._sim_timer.setInterval(100)
+        self._sim_timer.timeout.connect(self._sim_tick)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -71,6 +76,13 @@ class EEGPanel(QWidget):
             quality_row.addWidget(lbl)
         quality_row.addStretch()
 
+        self._sim_btn = QPushButton("▶ Simulate")
+        self._sim_btn.setCheckable(True)
+        self._sim_btn.setFixedWidth(100)
+        self._sim_btn.setToolTip("Generate synthetic sine-wave EEG without hardware")
+        self._sim_btn.clicked.connect(self._on_simulate_toggle)
+        quality_row.addWidget(self._sim_btn)
+
         top_row = QHBoxLayout()
         top_row.addLayout(toggle_row)
         top_row.addLayout(quality_row)
@@ -93,10 +105,11 @@ class EEGPanel(QWidget):
         y_axis = self._plot.getAxis("left")
         y_axis.setTicks([[(off, name) for name, off in zip(CH_NAMES, CH_OFFSETS)]])
 
-        # One curve per channel
+        # One curve per channel — connect='finite' treats NaN as gap
         for i, ch in enumerate(CH_NAMES):
             pen = pg.mkPen(color=CHANNEL_COLORS[ch], width=1)
-            curve = self._plot.plot(self._x_arr, self._nan_y.copy(), pen=pen, name=ch)
+            curve = self._plot.plot(self._x_arr, self._nan_y.copy(),
+                                    pen=pen, name=ch, connect='finite')
             curve.setVisible(i < 4)
             self._curves.append(curve)
 
@@ -110,13 +123,15 @@ class EEGPanel(QWidget):
         y_sweep : (SWEEP_SIZE, 5) — raw µV, NaN where no data / eraser gap
         quality : list of 4 labels ('good'/'fair'/'poor')
         """
+        if self._sim_active:
+            return   # simulation drives the curves directly
         for i in range(len(CH_NAMES)):
             if not self._curves[i].isVisible():
                 continue
             y = y_sweep[:, i].copy()
             mask = ~np.isnan(y)
             y[mask] += CH_OFFSETS[i]
-            self._curves[i].setData(self._x_arr, y)
+            self._curves[i].setData(self._x_arr, y, connect='finite')
 
         for i, (lbl, q) in enumerate(zip(self._quality_labels, quality)):
             color = QUALITY_COLORS.get(q, QUALITY_COLORS["secondary"])
@@ -142,3 +157,26 @@ class EEGPanel(QWidget):
     def _on_toggle(self, ch_idx: int, state: int):
         visible = state == Qt.CheckState.Checked.value
         self._curves[ch_idx].setVisible(visible)
+
+    def _on_simulate_toggle(self, checked: bool):
+        self._sim_active = checked
+        self._sim_btn.setText("⏹ Stop Sim" if checked else "▶ Simulate")
+        if checked:
+            self._sim_phase = 0.0
+            self._sim_timer.start()
+        else:
+            self._sim_timer.stop()
+            self.reset()
+
+    def _sim_tick(self):
+        """Generate synthetic multi-frequency EEG to verify rendering pipeline."""
+        dt = 0.1  # 100 ms per tick
+        self._sim_phase += dt
+        t = self._x_arr
+        freqs  = [10.0, 8.0, 12.0, 9.0, 7.0]
+        amps   = [40.0, 35.0, 30.0, 38.0, 20.0]
+        for curve, f, a, off in zip(self._curves, freqs, amps, CH_OFFSETS):
+            if not curve.isVisible():
+                continue
+            y = a * np.sin(2 * np.pi * f * (t + self._sim_phase)) + off
+            curve.setData(self._x_arr, y)

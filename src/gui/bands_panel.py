@@ -9,7 +9,8 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLabel, QSplitter, QVBoxLayout, QWidget,
+    QCheckBox, QDoubleSpinBox, QHBoxLayout, QLabel,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 from src.gui.theme import BAND_COLORS, CH_NAMES, CHANNEL_COLORS
@@ -25,14 +26,14 @@ _BAR_GAP    = 0.05
 class BandsPanel(QWidget):
     """
     EEG Bands tab.
-    Call update(powers, band_history) from the slow QTimer (0.5 Hz).
-    powers       : dict band→ndarray(n_channels)
-    band_history : dict band→deque of (timestamp, avg_power)
+    Call refresh(powers, band_history) from the slow QTimer (0.5 Hz).
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._ch_visible = [True] * _N_CH
+        self._ch_visible   = [True] * _N_CH
+        self._band_visible = {b: True for b in _BANDS}
+        self._threshold_lines: dict[str, pg.InfiniteLine] = {}
         self._setup_ui()
 
     def _setup_ui(self):
@@ -44,20 +45,60 @@ class BandsPanel(QWidget):
         toggle_row = QHBoxLayout()
         toggle_row.setSpacing(16)
         toggle_row.addWidget(QLabel("Channels:"))
-        self._toggles: list[QCheckBox] = []
+        self._ch_toggles: list[QCheckBox] = []
         for i, ch in enumerate(CH_NAMES[:_N_CH]):
             cb = QCheckBox(ch)
+            cb.blockSignals(True)
             cb.setChecked(True)
+            cb.blockSignals(False)
             color = CHANNEL_COLORS[ch]
             cb.setStyleSheet(
                 f"QCheckBox {{ color: {color}; font-weight: bold; }}"
                 f"QCheckBox::indicator:checked {{ background-color: {color}; border-color: {color}; }}"
             )
-            cb.stateChanged.connect(lambda state, idx=i: self._on_toggle(idx, state))
-            self._toggles.append(cb)
+            cb.stateChanged.connect(lambda state, idx=i: self._on_ch_toggle(idx, state))
+            self._ch_toggles.append(cb)
             toggle_row.addWidget(cb)
         toggle_row.addStretch()
         root.addLayout(toggle_row)
+
+        # ── Band toggles + threshold spinboxes ────────────────────────────────
+        band_ctrl_row = QHBoxLayout()
+        band_ctrl_row.setSpacing(6)
+        band_ctrl_row.addWidget(QLabel("Bands:"))
+        self._band_toggles: dict[str, QCheckBox] = {}
+        self._band_spinboxes: dict[str, QDoubleSpinBox] = {}
+        for band in _BANDS:
+            col = QHBoxLayout()
+            col.setSpacing(2)
+            color = BAND_COLORS[band]
+            cb = QCheckBox(band)
+            cb.blockSignals(True)
+            cb.setChecked(True)
+            cb.blockSignals(False)
+            cb.setStyleSheet(
+                f"QCheckBox {{ color: {color}; font-weight: bold; font-size: 11px; }}"
+            )
+            cb.stateChanged.connect(
+                lambda state, b=band: self._on_band_toggle(b, state)
+            )
+            self._band_toggles[band] = cb
+            spin = QDoubleSpinBox()
+            spin.setRange(0, 5000)
+            spin.setSingleStep(5)
+            spin.setValue(0)   # 0 = no threshold line
+            spin.setDecimals(0)
+            spin.setFixedWidth(68)
+            spin.setToolTip(f"{band} threshold (µV²); 0 = disabled")
+            spin.valueChanged.connect(
+                lambda val, b=band: self._on_threshold_change(b, val)
+            )
+            self._band_spinboxes[band] = spin
+            col.addWidget(cb)
+            col.addWidget(spin)
+            band_ctrl_row.addLayout(col)
+        band_ctrl_row.addStretch()
+        root.addLayout(band_ctrl_row)
 
         # ── Splitter: bar chart top, history bottom ───────────────────────────
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -91,7 +132,7 @@ class BandsPanel(QWidget):
 
         # History plot
         self._hist_plot = pg.PlotWidget(background="#111111")
-        self._hist_plot.setMouseEnabled(x=False, y=False)
+        self._hist_plot.setMouseEnabled(x=True, y=True)
         self._hist_plot.setMenuEnabled(False)
         self._hist_plot.showGrid(x=True, y=True, alpha=0.2)
         self._hist_plot.setLabel("bottom", "Time (s)", color="#888")
@@ -138,10 +179,32 @@ class BandsPanel(QWidget):
 
     # ── Private ───────────────────────────────────────────────────────────────
 
-    def _on_toggle(self, ch_idx: int, state: int):
+    def _on_ch_toggle(self, ch_idx: int, state: int):
         self._ch_visible[ch_idx] = (state == Qt.CheckState.Checked.value)
-        # Re-render with last data if needed; bars will be updated on next tick
         for b_idx in range(len(_BANDS)):
-            bar = self._bars[b_idx][ch_idx]
             if not self._ch_visible[ch_idx]:
-                bar.setOpts(height=0)
+                self._bars[b_idx][ch_idx].setOpts(height=0)
+
+    def _on_band_toggle(self, band: str, state: int):
+        visible = (state == Qt.CheckState.Checked.value)
+        self._band_visible[band] = visible
+        b_idx = _BANDS.index(band)
+        for c_idx in range(_N_CH):
+            self._bars[b_idx][c_idx].setOpts(height=0 if not visible else None)
+        if band in self._hist_curves:
+            self._hist_curves[band].setVisible(visible)
+
+    def _on_threshold_change(self, band: str, value: float):
+        if band in self._threshold_lines:
+            self._bar_plot.removeItem(self._threshold_lines[band])
+            del self._threshold_lines[band]
+        if value > 0:
+            line = pg.InfiniteLine(
+                pos=value, angle=0,
+                pen=pg.mkPen(BAND_COLORS[band], width=1,
+                             style=Qt.PenStyle.DashLine),
+                label=f"{band}={value:.0f}",
+                labelOpts={"color": BAND_COLORS[band], "position": 0.98},
+            )
+            self._bar_plot.addItem(line)
+            self._threshold_lines[band] = line

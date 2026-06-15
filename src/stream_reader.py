@@ -27,6 +27,8 @@ CHANNEL_NAMES    = ["TP9", "AF7", "AF8", "TP10", "AUX"]
 CHANNEL_COUNT    = 5
 BUFFER_SECONDS   = 60           # keep last 60 s in memory
 SCAN_TIMEOUT     = 10.5         # seconds BLE scan runs
+PPG_SAMPLE_RATE  = 64           # Hz
+PPG_CHANNEL_COUNT = 3           # ambient, IR, red
 
 
 class StreamReader:
@@ -61,12 +63,18 @@ class StreamReader:
         self._running      = False
         self._connected    = False
         self._scanning     = False
-        self._sample_count = 0    # monotonically increasing total samples written
+        self._sample_count = 0    # monotonically increasing total EEG samples written
 
-        self.sample_rate: float   = float(MUSE_SAMPLE_RATE)
-        self.device_name: str     = ""
-        self.device_address: str  = ""
-        self.last_error: str      = ""
+        # PPG buffer
+        self._ppg_buffer: deque = deque(maxlen=PPG_SAMPLE_RATE * BUFFER_SECONDS)
+        self._ppg_lock    = threading.Lock()
+        self._ppg_count   = 0
+
+        self.sample_rate: float      = float(MUSE_SAMPLE_RATE)
+        self.ppg_sample_rate: float  = float(PPG_SAMPLE_RATE)
+        self.device_name: str        = ""
+        self.device_address: str     = ""
+        self.last_error: str         = ""
 
         # List of discovered devices: [{"name": ..., "address": ...}, ...]
         self.discovered_devices: list[dict] = []
@@ -152,6 +160,7 @@ class StreamReader:
                     address=address,
                     name=name,
                     callback_eeg=self._on_eeg_data,
+                    callback_ppg=self._on_ppg_data,
                     backend="bleak",
                 )
 
@@ -199,6 +208,23 @@ class StreamReader:
 
         return self._connected
 
+    def start_async(
+        self,
+        address: str | None = None,
+        name:    str | None = None,
+        on_result: Callable[[bool, str], None] | None = None,
+    ) -> None:
+        """
+        Non-blocking connect.  Returns immediately.
+        Calls on_result(True, "") on success or on_result(False, error) on failure.
+        """
+        def _run():
+            self.start(address=address, name=name)
+            if on_result:
+                on_result(self._connected, self.last_error)
+
+        threading.Thread(target=_run, daemon=True, name="ble-async-wait").start()
+
     def stop(self):
         """Disconnect from the Muse S and stop the background thread."""
         self._stop_event.set()
@@ -207,6 +233,15 @@ class StreamReader:
         if self._stream_thread:
             self._stream_thread.join(timeout=5.0)
         self._muse = None
+
+    def clear(self) -> None:
+        """Reset all EEG and PPG data buffers (device stays connected)."""
+        with self._lock:
+            self._buffer.clear()
+            self._sample_count = 0
+        with self._ppg_lock:
+            self._ppg_buffer.clear()
+            self._ppg_count = 0
 
     # ── Public data API ───────────────────────────────────────────────────────────
 
@@ -274,7 +309,50 @@ class StreamReader:
         data       = np.array([it[1] for it in items])
         return data, timestamps
 
-    # ── muselsl EEG callback ──────────────────────────────────────────────────────
+    # ── PPG data API ──────────────────────────────────────────────────────────────
+
+    @property
+    def ppg_count(self) -> int:
+        return self._ppg_count
+
+    def get_new_ppg_samples(self, from_count: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return PPG samples written after from_count. Shape (n, 3)."""
+        with self._ppg_lock:
+            n_new = min(self._ppg_count - from_count, len(self._ppg_buffer))
+            if n_new <= 0:
+                return np.empty((0, PPG_CHANNEL_COUNT)), np.empty(0)
+            items = list(self._ppg_buffer)[-n_new:]
+        timestamps = np.array([it[0] for it in items])
+        data       = np.array([it[1] for it in items])
+        return data, timestamps
+
+    def get_ppg_window(self, seconds: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
+        """Return latest N seconds of PPG. Shape (n, 3)."""
+        n = int(seconds * self.ppg_sample_rate)
+        with self._ppg_lock:
+            items = list(self._ppg_buffer)[-n:]
+        if not items:
+            return np.empty((0, PPG_CHANNEL_COUNT)), np.empty(0)
+        timestamps = np.array([it[0] for it in items])
+        data       = np.array([it[1] for it in items])
+        return data, timestamps
+
+    # ── muselsl PPG + EEG callbacks ───────────────────────────────────────────────
+
+    def _on_ppg_data(self, data: np.ndarray, timestamps: np.ndarray) -> None:
+        """
+        Called by muselsl on each PPG notification.
+        data : (3, n_samples) — channels: ambient, IR, red
+        """
+        try:
+            samples = data.T  # (n, 3)
+            now = time.time()
+            with self._ppg_lock:
+                for i, ts in enumerate(timestamps):
+                    self._ppg_buffer.append((ts if ts > 0 else now, samples[i].tolist()))
+                    self._ppg_count += 1
+        except Exception as exc:
+            print(f"[StreamReader] PPG callback error: {exc}")
 
     def _on_eeg_data(self, data: np.ndarray, timestamps: np.ndarray) -> None:
         """

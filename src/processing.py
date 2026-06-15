@@ -58,14 +58,16 @@ class EEGProcessor:
         self._notch_sos = _notch_sos(notch_freq, sample_rate)
 
         # Rolling metric history  {metric_name: deque of (time, value)}
+        _metrics = ("workload", "fatigue", "stress", "attention", "faa")
         self.metric_history: dict[str, deque] = {
-            "workload": deque(maxlen=METRIC_HISTORY_MAX),
-            "fatigue":  deque(maxlen=METRIC_HISTORY_MAX),
+            m: deque(maxlen=METRIC_HISTORY_MAX) for m in _metrics
         }
         # Baseline buffer for normalisation
         self._baseline_buf: deque = deque(maxlen=BASELINE_SECONDS * 2)
         self._baseline_mean: dict = {}
         self._baseline_std:  dict = {}
+        # EMA smoothing state
+        self._ema_state: dict[str, float] = {}
 
     # ── Filtering ───────────────────────────────────────────────────────────────
 
@@ -140,38 +142,64 @@ class EEGProcessor:
 
     # ── Mental metrics ──────────────────────────────────────────────────────────
 
-    def compute_metrics_from_powers(self, frontal_powers: dict, timestamp: float) -> dict[str, float]:
+    def compute_metrics_from_powers(self, frontal_powers: dict, timestamp: float,
+                                     ch_powers: dict | None = None) -> dict[str, float]:
         """
-        Compute Mental Workload and Fatigue from pre-computed frontal band powers.
+        Compute all 5 mental metrics from frontal band powers.
 
         Parameters
         ----------
         frontal_powers : {"theta": float, "alpha": float, "beta": float}
-                         Mean power (µV²) across frontal channels (AF7+AF8).
+                         Mean power across AF7+AF8.
         timestamp      : Unix time for metric history.
+        ch_powers      : Full band_powers dict (needed for per-channel FAA).
+                         If None, FAA uses frontal mean (less accurate).
 
         Returns
         -------
-        {"workload": float, "fatigue": float}
+        {"workload", "fatigue", "stress", "attention", "faa"}
         """
-        eps = 1e-9
+        eps     = 1e-9
         theta_f = frontal_powers.get("theta", 0.0)
         alpha_f = frontal_powers.get("alpha", 0.0)
         beta_f  = frontal_powers.get("beta",  0.0)
 
+        # — Existing metrics —
         raw_workload = (theta_f + alpha_f) / (alpha_f + beta_f + eps)
         raw_fatigue  = theta_f / (alpha_f + eps)
 
-        self._baseline_buf.append({"workload": raw_workload, "fatigue": raw_fatigue})
+        # — Stress: β/α frontal (Alarcao & Fonseca 2017; Pope et al. 1995) —
+        raw_stress = beta_f / (alpha_f + eps)
+
+        # — Attention/Engagement: β/(θ+α) frontal (Pope et al. 1995) —
+        raw_attention = beta_f / (theta_f + alpha_f + eps)
+
+        # — Frontal Alpha Asymmetry: ln(α_AF8) − ln(α_AF7) (Davidson 1990) —
+        if ch_powers is not None:
+            alpha_ch = ch_powers.get("alpha", np.zeros(5))
+            alpha_af7 = float(alpha_ch[1]) + eps   # AF7 = index 1
+            alpha_af8 = float(alpha_ch[2]) + eps   # AF8 = index 2
+        else:
+            alpha_af7 = alpha_af8 = alpha_f + eps
+        raw_faa = float(np.log(alpha_af8) - np.log(alpha_af7))
+
+        raw_vals = {
+            "workload": raw_workload, "fatigue": raw_fatigue,
+            "stress":   raw_stress,   "attention": raw_attention,
+        }
+        self._baseline_buf.append(raw_vals)
         self._update_baseline()
 
-        norm_wl = self._normalise("workload", raw_workload)
-        norm_fa = self._normalise("fatigue",  raw_fatigue)
+        metrics = {}
+        for k, v in raw_vals.items():
+            metrics[k] = self._ema(k, self._normalise(k, v))
+        # FAA: z-score but allow negative (mapped to 0-100 where 50=neutral)
+        metrics["faa"] = self._ema("faa", self._normalise_faa(raw_faa))
 
-        self.metric_history["workload"].append((timestamp, norm_wl))
-        self.metric_history["fatigue"].append((timestamp, norm_fa))
+        for k, v in metrics.items():
+            self.metric_history[k].append((timestamp, v))
 
-        return {"workload": norm_wl, "fatigue": norm_fa}
+        return metrics
 
     def get_metric_history(self, metric: str, last_seconds: float | None = None
                            ) -> tuple[np.ndarray, np.ndarray]:
@@ -192,6 +220,7 @@ class EEGProcessor:
         self._baseline_buf.clear()
         self._baseline_mean.clear()
         self._baseline_std.clear()
+        self._ema_state.clear()
 
     # ── Signal quality ──────────────────────────────────────────────────────────
 
@@ -221,17 +250,32 @@ class EEGProcessor:
         """Recompute baseline stats from the rolling buffer."""
         if len(self._baseline_buf) < 10:
             return
-        for key in ("workload", "fatigue"):
-            vals = [d[key] for d in self._baseline_buf]
-            self._baseline_mean[key] = float(np.mean(vals))
-            self._baseline_std[key]  = float(np.std(vals)) or 1.0
+        for key in ("workload", "fatigue", "stress", "attention"):
+            vals = [d[key] for d in self._baseline_buf if key in d]
+            if vals:
+                self._baseline_mean[key] = float(np.mean(vals))
+                self._baseline_std[key]  = float(np.std(vals)) or 1.0
 
     def _normalise(self, key: str, raw: float) -> float:
         """Z-score normalise then map to 0–100 (clipped)."""
         if key not in self._baseline_mean:
-            # No baseline yet — linear stretch assuming typical ranges
-            scale = {"workload": 3.0, "fatigue": 5.0}.get(key, 2.0)
+            scale = {"workload": 3.0, "fatigue": 5.0,
+                     "stress": 3.0, "attention": 1.0}.get(key, 2.0)
             return float(np.clip(raw / scale * 100, 0, 100))
         z     = (raw - self._baseline_mean[key]) / (self._baseline_std[key] + 1e-9)
-        score = (z + 3) / 6 * 100          # map [-3σ, +3σ] → [0, 100]
+        score = (z + 3) / 6 * 100
         return float(np.clip(score, 0, 100))
+
+    def _normalise_faa(self, raw_faa: float) -> float:
+        """Map FAA from [-3σ, +3σ] to [0, 100] where 50=neutral."""
+        faa_std = self._baseline_std.get("_faa", 1.0)
+        faa_mean = self._baseline_mean.get("_faa", 0.0)
+        z = (raw_faa - faa_mean) / (faa_std + 1e-9)
+        return float(np.clip((z + 3) / 6 * 100, 0, 100))
+
+    def _ema(self, key: str, new_val: float, alpha: float = 0.3) -> float:
+        """Exponential moving average; alpha=0.3 (heavy smoothing)."""
+        prev = self._ema_state.get(key, new_val)
+        smooth = alpha * new_val + (1.0 - alpha) * prev
+        self._ema_state[key] = smooth
+        return smooth
