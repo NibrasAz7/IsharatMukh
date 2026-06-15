@@ -12,6 +12,10 @@ build/
 # Data recordings (large files)
 data/
 
+# BlueMuse reference folders (not part of the Python project)
+BlueMuse_*/
+BlueMuse-*/
+
 # IDE
 .vscode/
 .idea/
