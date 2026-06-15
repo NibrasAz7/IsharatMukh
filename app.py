@@ -10,26 +10,35 @@ Then open http://localhost:8050 in your browser.
 """
 
 import time
-from datetime import datetime, timedelta
+from collections import deque
+from datetime import timedelta
 
 import dash
 import dash_bootstrap_components as dbc
 import numpy as np
 import plotly.graph_objects as go
-from dash import Input, Output, State, callback_context, no_update
+from dash import Input, Output, Patch, State, no_update
 
 from src.data_manager import save_recording
-from src.layout import CHANNEL_COLORS, _gauge_figure, build_layout
+from src.layout import (
+    CHANNEL_COLORS, CH_OFFSETS, ERASER_WIDTH, SWEEP_SIZE, SWEEP_WINDOW_S,
+    _gauge_figure, build_layout,
+)
 from src.processing import BANDS, EEGProcessor
 from src.stream_reader import CHANNEL_NAMES, StreamReader
 
-# ── Global state ─────────────────────────────────────────────────────────────────
-# These live for the lifetime of the server process.
+# ── Global singletons ─────────────────────────────────────────────────────────
 _reader    = StreamReader()
 _processor = EEGProcessor(notch_freq=50.0)
 
-# Band power rolling history: {band: [(timestamp, avg_power), ...]}
-from collections import deque
+# ── Sweep display state ───────────────────────────────────────────────────────
+N_CH           = 5
+_y_sweep       = np.full((SWEEP_SIZE, N_CH), np.nan)   # circular display buffer
+_write_idx     = 0                                       # next write position
+_last_seen     = 0                                       # sample_count consumed
+_filter_states = _processor.make_filter_states(N_CH)    # causal filter memory
+
+# Band power rolling history: {band: deque of (timestamp, avg_power)}
 _band_history: dict[str, deque] = {b: deque(maxlen=3600) for b in BANDS}
 
 # ── App init ──────────────────────────────────────────────────────────────────────
@@ -43,54 +52,24 @@ app.layout = build_layout()
 server = app.server   # expose for potential WSGI deployment
 
 
-# ── Helper: build raw EEG figure ─────────────────────────────────────────────────
+# ── Figure helpers (slow path only) ──────────────────────────────────────────
 
-def _raw_fig(data: np.ndarray, timestamps: np.ndarray,
-             show_channels: list[bool], window_s: float) -> go.Figure:
-    ch_names = ["TP9", "AF7", "AF8", "TP10", "AUX"]
-    fig = go.Figure()
-
-    if data.shape[0] == 0:
-        fig.update_layout(**_dark_layout("µV"))
-        return fig
-
-    t_rel = timestamps - timestamps[0]   # relative seconds
-
-    for i, ch in enumerate(ch_names):
-        if i < len(show_channels) and show_channels[i]:
-            fig.add_trace(go.Scattergl(
-                x=t_rel,
-                y=data[:, i],
-                name=ch,
-                line={"color": CHANNEL_COLORS.get(ch, "#fff"), "width": 1},
-                mode="lines",
-            ))
-
-    fig.update_layout(
-        **_dark_layout("µV"),
-        xaxis_title="Time (s)",
-        xaxis={"range": [max(0, t_rel[-1] - window_s), t_rel[-1]],
-               "gridcolor": "#2a2a2a", "color": "#777"},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.01},
-        margin={"l": 55, "r": 10, "t": 10, "b": 40},
-        uirevision="raw-eeg",
-    )
-    return fig
+def _dark_layout(yaxis_title: str = "") -> dict:
+    return {
+        "plot_bgcolor":  "#111",
+        "paper_bgcolor": "#111",
+        "font":          {"color": "#ccc"},
+        "yaxis":         {"title": yaxis_title, "gridcolor": "#2a2a2a", "color": "#777"},
+    }
 
 
-# ── Helper: band power figures ────────────────────────────────────────────────────
-
-def _bands_bar_fig(powers: dict[str, np.ndarray]) -> go.Figure:
+def _bands_bar_fig(powers: dict) -> go.Figure:
     band_colors = {
-        "delta": "#6c8ebf",
-        "theta": "#82b366",
-        "alpha": "#d6b656",
-        "beta":  "#ae4132",
-        "gamma": "#9673a6",
+        "delta": "#6c8ebf", "theta": "#82b366", "alpha": "#d6b656",
+        "beta": "#ae4132", "gamma": "#9673a6",
     }
     fig = go.Figure()
-    ch_names = CHANNEL_NAMES[:4]
-    for ch_i, ch in enumerate(ch_names):
+    for ch_i, ch in enumerate(CHANNEL_NAMES[:4]):
         fig.add_trace(go.Bar(
             name=ch,
             x=list(BANDS.keys()),
@@ -105,49 +84,15 @@ def _bands_bar_fig(powers: dict[str, np.ndarray]) -> go.Figure:
         legend={"orientation": "h"},
         margin={"l": 55, "r": 10, "t": 40, "b": 40},
         xaxis={"color": "#777"},
-    )
-    return fig
-
-
-def _bands_radar_fig(powers: dict[str, np.ndarray]) -> go.Figure:
-    band_names = list(BANDS.keys())
-    fig = go.Figure()
-    for ch_i, ch in enumerate(CHANNEL_NAMES[:4]):
-        vals = [float(powers[b][ch_i]) if b in powers and len(powers[b]) > ch_i else 0
-                for b in band_names]
-        vals_norm = _minmax_norm(vals)
-        fig.add_trace(go.Scatterpolar(
-            r=vals_norm + [vals_norm[0]],
-            theta=band_names + [band_names[0]],
-            name=ch,
-            line={"color": CHANNEL_COLORS.get(ch, "#aaa")},
-            fill="toself",
-            fillcolor=CHANNEL_COLORS.get(ch, "#aaa"),
-            opacity=0.25,
-        ))
-    fig.update_layout(
-        polar={
-            "bgcolor": "#1a1a1a",
-            "radialaxis": {"visible": True, "color": "#555", "gridcolor": "#333"},
-            "angularaxis": {"color": "#777"},
-        },
-        paper_bgcolor="#111",
-        font={"color": "#ccc"},
-        margin={"l": 20, "r": 20, "t": 30, "b": 20},
-        title={"text": "Band Profile", "font": {"color": "#ccc"}},
-        legend={"orientation": "h"},
-        uirevision="radar",
+        uirevision="bands-bar",
     )
     return fig
 
 
 def _bands_history_fig() -> go.Figure:
     band_colors = {
-        "delta": "#6c8ebf",
-        "theta": "#82b366",
-        "alpha": "#d6b656",
-        "beta":  "#ae4132",
-        "gamma": "#9673a6",
+        "delta": "#6c8ebf", "theta": "#82b366", "alpha": "#d6b656",
+        "beta": "#ae4132", "gamma": "#9673a6",
     }
     fig = go.Figure()
     for band, hist in _band_history.items():
@@ -172,8 +117,6 @@ def _bands_history_fig() -> go.Figure:
     return fig
 
 
-# ── Helper: metric history figures ───────────────────────────────────────────────
-
 def _metric_history_fig(metric: str, color: str, title: str) -> go.Figure:
     ts, vals = _processor.get_metric_history(metric)
     fig = go.Figure()
@@ -187,7 +130,6 @@ def _metric_history_fig(metric: str, color: str, title: str) -> go.Figure:
             fillcolor=color.replace(")", ",0.15)").replace("rgb", "rgba"),
             name=title,
         ))
-        # Add threshold line at 75
         fig.add_hline(y=75, line_dash="dash", line_color="#ff6666",
                       annotation_text="High", annotation_position="right")
     fig.update_layout(
@@ -199,6 +141,10 @@ def _metric_history_fig(metric: str, color: str, title: str) -> go.Figure:
         uirevision=f"metric-{metric}",
     )
     return fig
+
+
+def _quality_to_color(label: str) -> str:
+    return {"good": "success", "fair": "warning", "poor": "danger"}.get(label, "secondary")
 
 
 # ── Callback: scan for BLE devices ──────────────────────────────────────────────
@@ -240,36 +186,43 @@ def poll_scan_results(n):
     return options, options[0]["value"], f"✓ {len(devices)} device(s) found", False, True
 
 
-# ── Callback: stream toggle ───────────────────────────────────────────────────────
+# ── Callback: stream toggle ───────────────────────────────────────────────────
 
 @app.callback(
-    Output("btn-stream-toggle",  "children"),
-    Output("btn-stream-toggle",  "color"),
-    Output("connection-badge",   "children"),
-    Output("connection-badge",   "color"),
-    Output("interval-update",    "disabled"),
-    Output("interval-timer",     "disabled"),
+    Output("btn-stream-toggle",   "children"),
+    Output("btn-stream-toggle",   "color"),
+    Output("connection-badge",    "children"),
+    Output("connection-badge",    "color"),
+    Output("interval-eeg",        "disabled"),
+    Output("interval-slow",       "disabled"),
+    Output("interval-timer",      "disabled"),
     Output("store-stream-active", "data"),
-    Input("btn-stream-toggle",   "n_clicks"),
-    State("store-stream-active", "data"),
-    State("device-dropdown",     "value"),
+    Input("btn-stream-toggle",    "n_clicks"),
+    State("store-stream-active",  "data"),
+    State("device-dropdown",      "value"),
     prevent_initial_call=True,
 )
 def toggle_stream(n_clicks, is_active, selected_address):
+    global _y_sweep, _write_idx, _last_seen, _filter_states
     if not is_active:
         ok = _reader.start(address=selected_address or None)
         if ok:
+            # Reset sweep state for fresh connection
+            _y_sweep[:] = np.nan
+            _write_idx  = 0
+            _last_seen  = _reader.sample_count
+            _filter_states = _processor.make_filter_states(N_CH)
             label = f"⏹ Disconnect ({_reader.device_name})"
-            return label, "danger", "● LIVE", "success", False, False, True
+            return label, "danger", "● LIVE", "success", False, False, False, True
         else:
             err = _reader.last_error or "BLE connection failed"
-            return "▶ Connect", "success", f"● FAILED: {err}", "danger", True, True, False
+            return "▶ Connect", "success", f"● FAILED: {err}", "danger", True, True, True, False
     else:
         _reader.stop()
-        return "▶ Connect", "success", "● OFFLINE", "secondary", True, True, False
+        return "▶ Connect", "success", "● OFFLINE", "secondary", True, True, True, False
 
 
-# ── Callback: notch filter change ────────────────────────────────────────────────
+# ── Callback: notch filter change ─────────────────────────────────────────────
 
 @app.callback(
     Output("store-notch", "data"),
@@ -277,23 +230,25 @@ def toggle_stream(n_clicks, is_active, selected_address):
     prevent_initial_call=True,
 )
 def update_notch(freq):
-    from scipy.signal import iirnotch, tf2sos
     from src.processing import _notch_sos
     _processor._notch_sos = _notch_sos(freq, _processor.fs)
+    # Reset causal filter states so transient from old filter clears
+    global _filter_states
+    _filter_states = _processor.make_filter_states(N_CH)
     return freq
 
 
-# ── Callback: recording toggle ────────────────────────────────────────────────────
+# ── Callback: recording toggle ─────────────────────────────────────────────────
 
 @app.callback(
-    Output("btn-record-toggle",    "children"),
-    Output("btn-record-toggle",    "color"),
-    Output("btn-save",             "disabled"),
-    Output("store-recording-active", "data"),
-    Output("store-record-start",   "data"),
-    Input("btn-record-toggle",     "n_clicks"),
+    Output("btn-record-toggle",     "children"),
+    Output("btn-record-toggle",     "color"),
+    Output("btn-save",              "disabled"),
+    Output("store-recording-active","data"),
+    Output("store-record-start",    "data"),
+    Input("btn-record-toggle",      "n_clicks"),
     State("store-recording-active", "data"),
-    State("store-stream-active",   "data"),
+    State("store-stream-active",    "data"),
     prevent_initial_call=True,
 )
 def toggle_recording(n_clicks, is_recording, stream_active):
@@ -301,11 +256,10 @@ def toggle_recording(n_clicks, is_recording, stream_active):
         return no_update, no_update, no_update, no_update, no_update
     if not is_recording:
         return "⏹ Stop Recording", "danger", True, True, time.time()
-    else:
-        return "⏺ Start Recording", "danger", False, False, no_update
+    return "⏺ Start Recording", "danger", False, False, no_update
 
 
-# ── Callback: save data ───────────────────────────────────────────────────────────
+# ── Callback: save data ───────────────────────────────────────────────────────
 
 @app.callback(
     Output("save-status", "children"),
@@ -320,12 +274,11 @@ def save_data(n_clicks):
         "workload": list(_processor.metric_history["workload"]),
         "fatigue":  list(_processor.metric_history["fatigue"]),
     }
-    paths = save_recording(ts, data, sample_rate=_reader.sample_rate,
-                           metric_history=metric_h)
+    save_recording(ts, data, sample_rate=_reader.sample_rate, metric_history=metric_h)
     return f"✓ Saved ({data.shape[0]} samples)"
 
 
-# ── Callback: recording timer ─────────────────────────────────────────────────────
+# ── Callback: recording timer ─────────────────────────────────────────────────
 
 @app.callback(
     Output("recording-timer", "children"),
@@ -336,137 +289,134 @@ def save_data(n_clicks):
 def update_timer(n, is_recording, start_time):
     if not is_recording or start_time is None:
         return "00:00:00"
-    elapsed = int(time.time() - start_time)
-    return str(timedelta(seconds=elapsed))
+    return str(timedelta(seconds=int(time.time() - start_time)))
 
 
-# ── Main update callback ──────────────────────────────────────────────────────────
+# ── Callback: fast EEG sweep (10 Hz) ─────────────────────────────────────────
 
 @app.callback(
-    # Raw EEG
-    Output("graph-raw-eeg",        "figure"),
-    # Signal quality badges
-    Output("quality-tp9",          "color"),
-    Output("quality-af7",          "color"),
-    Output("quality-af8",          "color"),
-    Output("quality-tp10",         "color"),
-    # Band power
-    Output("graph-bands-bar",      "figure"),
-    Output("graph-bands-radar",    "figure"),
-    Output("graph-bands-history",  "figure"),
-    # Mental state
-    Output("gauge-workload",       "figure"),
-    Output("gauge-fatigue",        "figure"),
-    Output("graph-workload-history","figure"),
-    Output("graph-fatigue-history", "figure"),
-    # Inputs
-    Input("interval-update",       "n_intervals"),
-    State("window-slider",         "value"),
-    State("toggle-tp9",            "value"),
-    State("toggle-af7",            "value"),
-    State("toggle-af8",            "value"),
-    State("toggle-tp10",           "value"),
-    State("toggle-aux",            "value"),
-    State("main-tabs",             "active_tab"),
+    Output("graph-raw-eeg", "figure"),
+    Output("quality-tp9",   "color"),
+    Output("quality-af7",   "color"),
+    Output("quality-af8",   "color"),
+    Output("quality-tp10",  "color"),
+    Input("interval-eeg",   "n_intervals"),
+    State("toggle-tp9",     "value"),
+    State("toggle-af7",     "value"),
+    State("toggle-af8",     "value"),
+    State("toggle-tp10",    "value"),
+    State("toggle-aux",     "value"),
     prevent_initial_call=True,
 )
-def update_all(n_intervals, window_s, tp9, af7, af8, tp10, aux, active_tab):
-    show = [tp9, af7, af8, tp10, aux]
+def update_eeg_sweep(n, tp9, af7, af8, tp10, aux):
+    global _y_sweep, _write_idx, _last_seen, _filter_states
 
-    # Get raw window
-    raw, ts = _reader.get_window(seconds=max(window_s, 4))
-    if raw.shape[0] == 0:
-        empty = _empty_raw_fig()
-        return (empty, "secondary", "secondary", "secondary", "secondary",
-                *[no_update] * 8)
+    # 1. Pull only new samples since last tick
+    new_raw, _ = _reader.get_new_samples(_last_seen)
+    n_new = new_raw.shape[0]
+    _last_seen += n_new
 
-    # Filter
-    filtered = _processor.filter_signal(raw)
+    if n_new > 0:
+        # 2. Causal filter — fast, only the new samples
+        filtered, _filter_states = _processor.filter_new(new_raw, _filter_states)
 
-    # Signal quality
-    quality = _processor.signal_quality(filtered[:, :4])
+        # 3. Write into circular sweep buffer (handle wrap-around)
+        end = _write_idx + n_new
+        if end <= SWEEP_SIZE:
+            _y_sweep[_write_idx:end] = filtered
+        else:
+            first = SWEEP_SIZE - _write_idx
+            _y_sweep[_write_idx:] = filtered[:first]
+            _y_sweep[:end - SWEEP_SIZE] = filtered[first:]
+        _write_idx = end % SWEEP_SIZE
+
+        # 4. Stamp eraser gap (NaN) at write head — the moving "cursor"
+        eraser_end = min(_write_idx + ERASER_WIDTH, SWEEP_SIZE)
+        _y_sweep[_write_idx:eraser_end] = np.nan
+        wrap = (_write_idx + ERASER_WIDTH) - SWEEP_SIZE
+        if wrap > 0:
+            _y_sweep[:wrap] = np.nan
+
+    # 5. Signal quality from non-NaN region
+    valid = ~np.isnan(_y_sweep[:, :4])
+    if valid.any():
+        safe = np.where(valid, _y_sweep[:, :4], 0.0)
+        quality = _processor.signal_quality(safe)
+    else:
+        quality = ["poor"] * 4
     badge_colors = [_quality_to_color(q) for q in quality]
 
-    # Raw EEG figure (always update)
-    raw_fig = _raw_fig(filtered, ts, show, window_s)
+    # 6. Build Patch — update only the y-arrays of existing traces
+    show = [tp9, af7, af8, tp10, aux]
+    patched = Patch()
+    for i in range(N_CH):
+        if show[i]:
+            y = _y_sweep[:, i].copy()
+            mask = ~np.isnan(y)
+            y[mask] += CH_OFFSETS[i]
+            patched["data"][i]["y"] = y.tolist()
+        else:
+            patched["data"][i]["y"] = [float("nan")] * SWEEP_SIZE
 
-    # Band powers (compute from latest 4 s epoch)
-    epoch_samples = int(_reader.sample_rate * 4)
-    epoch = filtered[-epoch_samples:, :] if filtered.shape[0] >= epoch_samples else filtered
+    return patched, *badge_colors
+
+
+# ── Callback: slow band powers + mental metrics (0.5 Hz) ─────────────────────
+
+@app.callback(
+    Output("graph-bands-bar",        "figure"),
+    Output("graph-bands-history",    "figure"),
+    Output("gauge-workload",         "figure"),
+    Output("gauge-fatigue",          "figure"),
+    Output("graph-workload-history", "figure"),
+    Output("graph-fatigue-history",  "figure"),
+    Input("interval-slow",           "n_intervals"),
+    State("main-tabs",               "active_tab"),
+    prevent_initial_call=True,
+)
+def update_slow(n, active_tab):
+    # Get latest 4 s epoch
+    epoch_raw, _ = _reader.get_window(seconds=4)
+    if epoch_raw.shape[0] < int(_reader.sample_rate):
+        return no_update, no_update, no_update, no_update, no_update, no_update
+
+    # Zero-phase filter on epoch (fine at 0.5 Hz)
+    epoch = _processor.filter_signal(epoch_raw)
+
+    # Single Welch PSD — shared by both the bar chart and mental metrics
     powers = _processor.band_powers(epoch)
 
     # Update band history
     now = time.time()
     for band in BANDS:
-        avg_power = float(np.mean(powers[band][:4]))
-        _band_history[band].append((now, avg_power))
+        _band_history[band].append((now, float(np.mean(powers[band][:4]))))
 
-    # Mental metrics
-    metrics = _processor.compute_metrics(epoch, now)
+    # Frontal mean powers (AF7=idx1, AF8=idx2)
+    frontal_powers = {
+        b: float(np.mean(powers[b][[1, 2]]))
+        for b in ("theta", "alpha", "beta")
+    }
+    metrics = _processor.compute_metrics_from_powers(frontal_powers, now)
 
-    # Figures
-    bands_bar_fig    = _bands_bar_fig(powers) if active_tab == "tab-bands"   else no_update
-    bands_radar_fig  = _bands_radar_fig(powers) if active_tab == "tab-bands" else no_update
-    bands_hist_fig   = _bands_history_fig() if active_tab == "tab-bands"     else no_update
-
-    workload_val = metrics["workload"]
-    fatigue_val  = metrics["fatigue"]
+    # Only rebuild figures for the currently visible tab
+    if active_tab == "tab-bands":
+        bars_fig = _bands_bar_fig(powers)
+        hist_fig = _bands_history_fig()
+    else:
+        bars_fig = hist_fig = no_update
 
     if active_tab == "tab-mental":
-        gauge_wl  = _gauge_figure(workload_val, "Workload", "#f1a24e")
-        gauge_fa  = _gauge_figure(fatigue_val,  "Fatigue",  "#f14e7a")
-        hist_wl   = _metric_history_fig("workload", "rgb(241,162,78)",  "Mental Workload")
-        hist_fa   = _metric_history_fig("fatigue",  "rgb(241,78,122)",  "Mental Fatigue")
+        gauge_wl = _gauge_figure(metrics["workload"], "Workload", "#f1a24e")
+        gauge_fa = _gauge_figure(metrics["fatigue"],  "Fatigue",  "#f14e7a")
+        hist_wl  = _metric_history_fig("workload", "rgb(241,162,78)", "Mental Workload")
+        hist_fa  = _metric_history_fig("fatigue",  "rgb(241,78,122)", "Mental Fatigue")
     else:
         gauge_wl = gauge_fa = hist_wl = hist_fa = no_update
 
-    return (
-        raw_fig,
-        *badge_colors,
-        bands_bar_fig, bands_radar_fig, bands_hist_fig,
-        gauge_wl, gauge_fa, hist_wl, hist_fa,
-    )
+    return bars_fig, hist_fig, gauge_wl, gauge_fa, hist_wl, hist_fa
 
 
-# ── Utilities ─────────────────────────────────────────────────────────────────────
-
-def _dark_layout(yaxis_title: str = "") -> dict:
-    return {
-        "plot_bgcolor":  "#111",
-        "paper_bgcolor": "#111",
-        "font":          {"color": "#ccc"},
-        "yaxis":         {"title": yaxis_title, "gridcolor": "#2a2a2a", "color": "#777"},
-    }
-
-
-def _empty_raw_fig() -> go.Figure:
-    fig = go.Figure()
-    fig.update_layout(
-        **_dark_layout("µV"),
-        annotations=[{
-            "text": "Waiting for EEG data…",
-            "xref": "paper", "yref": "paper",
-            "x": 0.5, "y": 0.5,
-            "showarrow": False,
-            "font": {"color": "#555", "size": 18},
-        }],
-        margin={"l": 55, "r": 10, "t": 10, "b": 40},
-    )
-    return fig
-
-
-def _quality_to_color(label: str) -> str:
-    return {"good": "success", "fair": "warning", "poor": "danger"}.get(label, "secondary")
-
-
-def _minmax_norm(vals: list) -> list:
-    mn, mx = min(vals), max(vals)
-    if mx == mn:
-        return [0.5] * len(vals)
-    return [(v - mn) / (mx - mn) for v in vals]
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("\n" + "=" * 60)

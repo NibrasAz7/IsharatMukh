@@ -58,9 +58,10 @@ class StreamReader:
         self._scan_thread:   threading.Thread | None = None
         self._stop_event      = threading.Event()
 
-        self._running   = False
-        self._connected = False
-        self._scanning  = False
+        self._running      = False
+        self._connected    = False
+        self._scanning     = False
+        self._sample_count = 0    # monotonically increasing total samples written
 
         self.sample_rate: float   = float(MUSE_SAMPLE_RATE)
         self.device_name: str     = ""
@@ -218,9 +219,32 @@ class StreamReader:
         return self._scanning
 
     @property
+    def sample_count(self) -> int:
+        """Total samples ever written to the buffer (monotonically increasing)."""
+        return self._sample_count
+
+    @property
     def buffer_length(self) -> int:
         with self._lock:
             return len(self._buffer)
+
+    def get_new_samples(self, from_count: int) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return only samples written after `from_count`.
+
+        Returns
+        -------
+        data       : (n_new, 5)
+        timestamps : (n_new,)
+        """
+        with self._lock:
+            n_new = min(self._sample_count - from_count, len(self._buffer))
+            if n_new <= 0:
+                return np.empty((0, CHANNEL_COUNT)), np.empty(0)
+            items = list(self._buffer)[-n_new:]
+        timestamps = np.array([it[0] for it in items])
+        data       = np.array([it[1] for it in items])
+        return data, timestamps
 
     def get_window(self, seconds: float = 5.0) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -274,4 +298,5 @@ class StreamReader:
         with self._lock:
             for i, ts in enumerate(timestamps):
                 self._buffer.append((ts if ts > 0 else now, samples[i].tolist()))
+                self._sample_count += 1
 

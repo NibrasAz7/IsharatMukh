@@ -10,7 +10,7 @@ raw µV  →  bandpass 0.5–45 Hz  →  notch 50/60 Hz  →  band powers  →  
 from collections import deque
 
 import numpy as np
-from scipy.signal import butter, sosfilt, iirnotch, sosfiltfilt
+from scipy.signal import butter, sosfilt, sosfilt_zi, iirnotch, sosfiltfilt
 
 # ── Band definitions ────────────────────────────────────────────────────────────
 BANDS = {
@@ -72,13 +72,44 @@ class EEGProcessor:
     def filter_signal(self, data: np.ndarray) -> np.ndarray:
         """
         Apply bandpass + notch filter to a (n_samples, n_channels) array.
-        Returns filtered array of same shape.
+        Zero-phase (sosfiltfilt) — use for offline/epoch processing only.
         """
         if data.shape[0] < 10:
             return data
         filtered = sosfiltfilt(self._bp_sos,   data, axis=0)
         filtered = sosfiltfilt(self._notch_sos, filtered, axis=0)
         return filtered
+
+    def make_filter_states(self, n_channels: int) -> dict:
+        """Create zero initial causal filter states for n_channels."""
+        zi_bp    = sosfilt_zi(self._bp_sos)
+        zi_notch = sosfilt_zi(self._notch_sos)
+        return {
+            "bp":    np.zeros((zi_bp.shape[0],    n_channels, 2)),
+            "notch": np.zeros((zi_notch.shape[0], n_channels, 2)),
+        }
+
+    def filter_new(self, data: np.ndarray, states: dict) -> tuple[np.ndarray, dict]:
+        """
+        Causal online filter — processes only new samples, preserves filter memory.
+
+        Parameters
+        ----------
+        data   : (n_new_samples, n_channels)
+        states : dict with keys "bp" and "notch" (from make_filter_states)
+
+        Returns
+        -------
+        filtered : (n_new_samples, n_channels)
+        states   : updated states (mutated in-place and returned)
+        """
+        if data.shape[0] == 0:
+            return data, states
+        y, zi_bp    = sosfilt(self._bp_sos,    data, axis=0, zi=states["bp"])
+        y, zi_notch = sosfilt(self._notch_sos, y,    axis=0, zi=states["notch"])
+        states["bp"]    = zi_bp
+        states["notch"] = zi_notch
+        return y, states
 
     # ── Band power ──────────────────────────────────────────────────────────────
 
@@ -109,53 +140,38 @@ class EEGProcessor:
 
     # ── Mental metrics ──────────────────────────────────────────────────────────
 
-    def compute_metrics(self, data: np.ndarray, timestamp: float) -> dict[str, float]:
+    def compute_metrics_from_powers(self, frontal_powers: dict, timestamp: float) -> dict[str, float]:
         """
-        Compute Mental Workload and Mental Fatigue from a filtered epoch.
+        Compute Mental Workload and Fatigue from pre-computed frontal band powers.
 
-        Uses frontal channels (AF7=idx1, AF8=idx2) only.
-        Metrics are normalised 0–100 using a rolling baseline.
+        Parameters
+        ----------
+        frontal_powers : {"theta": float, "alpha": float, "beta": float}
+                         Mean power (µV²) across frontal channels (AF7+AF8).
+        timestamp      : Unix time for metric history.
 
         Returns
         -------
-        {"workload": float, "fatigue": float, "raw_workload": float, "raw_fatigue": float}
+        {"workload": float, "fatigue": float}
         """
-        if data.shape[0] < int(self.fs * 0.5):
-            return {"workload": 0.0, "fatigue": 0.0, "raw_workload": 0.0, "raw_fatigue": 0.0}
-
-        frontal = data[:, FRONTAL_CH_IDX]          # (n_samples, 2)
-        bp      = self.band_powers(frontal)
-
-        theta_f = float(np.mean(bp["theta"]))
-        alpha_f = float(np.mean(bp["alpha"]))
-        beta_f  = float(np.mean(bp["beta"]))
-
-        # Guard against division by zero
         eps = 1e-9
+        theta_f = frontal_powers.get("theta", 0.0)
+        alpha_f = frontal_powers.get("alpha", 0.0)
+        beta_f  = frontal_powers.get("beta",  0.0)
 
-        # Mental Workload = (θ + α) / (α + β)   (increases with cognitive load)
         raw_workload = (theta_f + alpha_f) / (alpha_f + beta_f + eps)
-
-        # Mental Fatigue  = θ / α               (increases with fatigue)
         raw_fatigue  = theta_f / (alpha_f + eps)
 
-        # Update baseline
         self._baseline_buf.append({"workload": raw_workload, "fatigue": raw_fatigue})
         self._update_baseline()
 
         norm_wl = self._normalise("workload", raw_workload)
         norm_fa = self._normalise("fatigue",  raw_fatigue)
 
-        # Append to history
         self.metric_history["workload"].append((timestamp, norm_wl))
         self.metric_history["fatigue"].append((timestamp, norm_fa))
 
-        return {
-            "workload":     norm_wl,
-            "fatigue":      norm_fa,
-            "raw_workload": raw_workload,
-            "raw_fatigue":  raw_fatigue,
-        }
+        return {"workload": norm_wl, "fatigue": norm_fa}
 
     def get_metric_history(self, metric: str, last_seconds: float | None = None
                            ) -> tuple[np.ndarray, np.ndarray]:

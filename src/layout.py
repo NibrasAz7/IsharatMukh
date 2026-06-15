@@ -3,6 +3,8 @@ layout.py
 Dash UI layout for the Muse S EEG Dashboard.
 """
 
+import numpy as np
+import plotly.graph_objects as go
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
@@ -13,6 +15,15 @@ CHANNEL_COLORS = {
     "TP10": "#f14e7a",
     "AUX":  "#a64ef1",
 }
+
+# Sweep display constants (shared with app.py via import)
+SWEEP_WINDOW_S  = 5               # seconds shown on fixed x-axis
+SWEEP_FS        = 256             # samples / second
+SWEEP_SIZE      = SWEEP_WINDOW_S * SWEEP_FS   # 1280 samples
+ERASER_WIDTH    = int(0.3 * SWEEP_FS)         # 77-sample NaN gap (cursor)
+# Vertical spacing so channels don't overlap (µV)
+CH_OFFSETS      = [300, 150, 0, -150, -300]   # TP9, AF7, AF8, TP10, AUX
+CH_YRANGE       = [-500, 500]
 
 # ── Status indicator helper ─────────────────────────────────────────────────────
 
@@ -145,16 +156,62 @@ def _sidebar() -> dbc.Col:
         dcc.Store(id="store-devices",          data=[]),
         dcc.Store(id="store-scan-done",        data=0),
         # Polling interval for scan results
-        dcc.Interval(id="interval-scan-poll", interval=500, n_intervals=0, disabled=True),
-
-        # Update interval
-        dcc.Interval(id="interval-update", interval=200, n_intervals=0, disabled=True),
-        dcc.Interval(id="interval-timer",   interval=1000, n_intervals=0, disabled=True),
+        dcc.Interval(id="interval-scan-poll", interval=500,  n_intervals=0, disabled=True),
+        # Fast: raw EEG sweep update (100 ms → 10 Hz)
+        dcc.Interval(id="interval-eeg",       interval=100,  n_intervals=0, disabled=True),
+        # Slow: band powers + mental metrics (2 s)
+        dcc.Interval(id="interval-slow",      interval=2000, n_intervals=0, disabled=True),
+        # Recording timer
+        dcc.Interval(id="interval-timer",     interval=1000, n_intervals=0, disabled=True),
 
     ], width=2, className="pe-1")
 
 
 # ── Raw EEG tab ──────────────────────────────────────────────────────────────────
+
+def _init_sweep_figure() -> go.Figure:
+    """Pre-allocate the sweep figure with NaN traces and a fixed x-axis."""
+    x_arr  = np.linspace(0, SWEEP_WINDOW_S, SWEEP_SIZE).tolist()
+    nan_y  = [float("nan")] * SWEEP_SIZE
+    ch_names = ["TP9", "AF7", "AF8", "TP10", "AUX"]
+    fig = go.Figure()
+    for i, ch in enumerate(ch_names):
+        fig.add_trace(go.Scattergl(
+            x=x_arr,
+            y=nan_y,
+            name=ch,
+            mode="lines",
+            line={"color": CHANNEL_COLORS[ch], "width": 1},
+            visible=(i < 4),
+        ))
+    fig.update_layout(
+        plot_bgcolor="#111",
+        paper_bgcolor="#111",
+        font={"color": "#ccc"},
+        xaxis={
+            "range": [0, SWEEP_WINDOW_S],
+            "fixedrange": True,
+            "gridcolor": "#2a2a2a",
+            "color": "#777",
+            "title": "Time (s)",
+            "tickmode": "linear",
+            "dtick": 1,
+        },
+        yaxis={
+            "range": CH_YRANGE,
+            "fixedrange": True,
+            "gridcolor": "#2a2a2a",
+            "color": "#777",
+            "title": "µV (offset per channel)",
+            "tickvals": CH_OFFSETS,
+            "ticktext": ["TP9", "AF7", "AF8", "TP10", "AUX"],
+        },
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.01},
+        margin={"l": 70, "r": 10, "t": 10, "b": 40},
+        uirevision="sweep",
+    )
+    return fig
+
 
 def _raw_eeg_tab() -> dbc.Tab:
     ch_toggles = [
@@ -183,7 +240,7 @@ def _raw_eeg_tab() -> dbc.Tab:
                         id="graph-raw-eeg",
                         config={"displayModeBar": False},
                         style={"height": "480px"},
-                        figure=_empty_figure("Waiting for stream…", "µV"),
+                        figure=_init_sweep_figure(),
                     ),
                 ]),
             ], className="shadow-sm mt-2"),
@@ -205,19 +262,10 @@ def _bands_tab() -> dbc.Tab:
                             dcc.Graph(
                                 id="graph-bands-bar",
                                 config={"displayModeBar": False},
-                                style={"height": "400px"},
+                                style={"height": "420px"},
                                 figure=_empty_figure("Waiting for stream…"),
                             ),
-                            width=6,
-                        ),
-                        dbc.Col(
-                            dcc.Graph(
-                                id="graph-bands-radar",
-                                config={"displayModeBar": False},
-                                style={"height": "400px"},
-                                figure=_empty_figure(""),
-                            ),
-                            width=6,
+                            width=12,
                         ),
                     ]),
                     dbc.Row([
