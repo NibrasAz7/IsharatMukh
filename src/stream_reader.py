@@ -60,12 +60,12 @@ class StreamReader:
 
         self._running   = False
         self._connected = False
-        self._demo_mode = False
         self._scanning  = False
 
-        self.sample_rate: float = float(MUSE_SAMPLE_RATE)
-        self.device_name: str   = ""
-        self.device_address: str = ""
+        self.sample_rate: float   = float(MUSE_SAMPLE_RATE)
+        self.device_name: str     = ""
+        self.device_address: str  = ""
+        self.last_error: str      = ""
 
         # List of discovered devices: [{"name": ..., "address": ...}, ...]
         self.discovered_devices: list[dict] = []
@@ -115,8 +115,8 @@ class StreamReader:
                   If None, auto-scans and picks the first Muse found.
         name    : Device name filter (optional, used only when address is None).
 
-        Returns True if BLE connection started (async), False on failure.
-        Falls back to demo mode if muselsl is unavailable.
+        Returns True on successful BLE connection, False on failure.
+        Never falls back to demo — buffer stays empty if no real device.
         """
         if self._running:
             return self._connected
@@ -125,22 +125,22 @@ class StreamReader:
             from muselsl.muse import Muse
             from muselsl.stream import find_muse
         except ImportError:
-            print("[StreamReader] muselsl not installed — falling back to demo mode.")
-            self._start_demo()
+            print("[StreamReader] muselsl not installed.")
+            self.last_error = "muselsl not installed"
             return False
 
         self._stop_event.clear()
+        self.last_error = ""
 
         def _connect_and_stream():
             nonlocal address, name
             try:
-                # Auto-discover if no address given
                 if not address:
                     print("[StreamReader] No address given — scanning for Muse…")
                     found = find_muse(name=name, backend="bleak")
                     if not found:
-                        print("[StreamReader] No Muse found — starting demo mode.")
-                        self._start_demo()
+                        print("[StreamReader] No Muse found.")
+                        self.last_error = "No Muse device found during scan"
                         return
                     address = found["address"]
                     name    = found["name"]
@@ -156,8 +156,8 @@ class StreamReader:
 
                 ok = self._muse.connect(retries=2)
                 if not ok:
-                    print("[StreamReader] BLE connect failed — falling back to demo mode.")
-                    self._start_demo()
+                    print("[StreamReader] BLE connect failed.")
+                    self.last_error = "BLE connection failed"
                     return
 
                 self._muse.start()
@@ -167,12 +167,10 @@ class StreamReader:
                 self.device_name     = name or "Muse"
                 print(f"[StreamReader] Streaming from {self.device_name}.")
 
-                # Keep the BLE event loop alive until stop() is called
                 from muselsl import backends
                 while not self._stop_event.is_set():
                     backends.sleep(0.5)
 
-                # Graceful disconnect
                 try:
                     self._muse.stop()
                     self._muse.disconnect()
@@ -181,8 +179,7 @@ class StreamReader:
 
             except Exception as exc:
                 print(f"[StreamReader] Connection error: {exc}")
-                if not self._running:
-                    self._start_demo()
+                self.last_error = str(exc)
             finally:
                 self._connected = False
                 self._running   = False
@@ -192,10 +189,10 @@ class StreamReader:
         )
         self._stream_thread.start()
 
-        # Wait up to 15 s for connect to succeed before returning
-        deadline = time.time() + 15.0
+        # Wait up to 20 s for the BLE connection to complete
+        deadline = time.time() + 20.0
         while time.time() < deadline:
-            if self._connected or self._demo_mode:
+            if self._connected or self.last_error:
                 break
             time.sleep(0.2)
 
@@ -215,10 +212,6 @@ class StreamReader:
     @property
     def is_connected(self) -> bool:
         return self._connected
-
-    @property
-    def is_demo(self) -> bool:
-        return self._demo_mode
 
     @property
     def is_scanning(self) -> bool:
@@ -282,27 +275,3 @@ class StreamReader:
             for i, ts in enumerate(timestamps):
                 self._buffer.append((ts if ts > 0 else now, samples[i].tolist()))
 
-    # ── Demo mode ─────────────────────────────────────────────────────────────────
-
-    def _start_demo(self):
-        """Generate synthetic EEG when no real Muse is available."""
-        self._demo_mode = True
-        self._running   = True
-        t = threading.Thread(target=self._demo_loop, daemon=True, name="demo-eeg")
-        t.start()
-
-    def _demo_loop(self):
-        t = 0.0
-        dt = 1.0 / MUSE_SAMPLE_RATE
-        rng = np.random.default_rng(seed=42)
-        while self._running and not self._stop_event.is_set():
-            alpha = 20.0 * np.sin(2 * np.pi * 10 * t)
-            theta = 10.0 * np.sin(2 * np.pi * 6  * t)
-            noise = rng.normal(0, 5, CHANNEL_COUNT)
-            sample = [alpha + theta + noise[i] for i in range(CHANNEL_COUNT)]
-            with self._lock:
-                self._buffer.append((time.time(), sample))
-            t += dt
-            time.sleep(dt)
-        self._running   = False
-        self._demo_mode = False

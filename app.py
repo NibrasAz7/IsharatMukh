@@ -257,14 +257,13 @@ def poll_scan_results(n):
 )
 def toggle_stream(n_clicks, is_active, selected_address):
     if not is_active:
-        _reader.start(address=selected_address or None)
-        if _reader.is_demo:
-            badge_text, badge_color = "● DEMO", "warning"
-            label = "⏹ Disconnect (demo)"
-        else:
-            badge_text, badge_color = "● LIVE", "success"
+        ok = _reader.start(address=selected_address or None)
+        if ok:
             label = f"⏹ Disconnect ({_reader.device_name})"
-        return label, "danger", badge_text, badge_color, False, False, True
+            return label, "danger", "● LIVE", "success", False, False, True
+        else:
+            err = _reader.last_error or "BLE connection failed"
+            return "▶ Connect", "success", f"● FAILED: {err}", "danger", True, True, False
     else:
         _reader.stop()
         return "▶ Connect", "success", "● OFFLINE", "secondary", True, True, False
