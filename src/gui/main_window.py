@@ -4,6 +4,7 @@ QMainWindow for the Muse S EEG Desktop Dashboard.
 """
 
 import time
+import traceback
 from collections import deque
 
 import numpy as np
@@ -201,6 +202,12 @@ class MainWindow(QMainWindow):
     # ═════════════════════════════════════════════════════════════════════════
 
     def _update_fast(self):
+        try:
+            self._do_update_fast()
+        except Exception:
+            traceback.print_exc()
+
+    def _do_update_fast(self):
         new_raw, _ = self._reader.get_new_samples(self._last_seen)
         n_new = new_raw.shape[0]
         self._last_seen += n_new
@@ -233,7 +240,7 @@ class MainWindow(QMainWindow):
         else:
             quality = ["poor"] * 4
 
-        self._eeg_panel.update(self._y_sweep, quality)
+        self._eeg_panel.refresh(self._y_sweep, quality)
 
     # ═════════════════════════════════════════════════════════════════════════
     # Slow update (2000 ms — bands + mental metrics)
@@ -259,8 +266,8 @@ class MainWindow(QMainWindow):
         }
         metrics = self._processor.compute_metrics_from_powers(frontal, now)
 
-        self._bands_panel.update(powers, self._band_history)
-        self._mental_panel.update(metrics, self._processor)
+        self._bands_panel.refresh(powers, self._band_history)
+        self._mental_panel.refresh(metrics, self._processor)
 
     # ═════════════════════════════════════════════════════════════════════════
     # Sidebar slots
@@ -300,7 +307,7 @@ class MainWindow(QMainWindow):
                 err = self._reader.last_error or "BLE connection failed"
                 self._btn_connect.setEnabled(True)
                 self._btn_connect.setText("▶  Connect")
-                self._set_status(f"● FAILED: {err}", "#cc3333")
+                self._set_status(f"● ERR: {err[:30]}", "#cc3333")
         else:
             self._reader.stop()
             self._on_disconnected()

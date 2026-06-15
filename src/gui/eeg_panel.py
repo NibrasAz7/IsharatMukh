@@ -32,6 +32,7 @@ class EEGPanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
+        self._curves: list[pg.PlotDataItem] = []  # init early so _on_toggle is safe
 
         # ── Channel toggle row ────────────────────────────────────────────────
         toggle_row = QHBoxLayout()
@@ -39,7 +40,9 @@ class EEGPanel(QWidget):
         self._toggles: dict[str, QCheckBox] = {}
         for i, ch in enumerate(CH_NAMES):
             cb = QCheckBox(ch)
+            cb.blockSignals(True)
             cb.setChecked(i < 4)   # AUX off by default
+            cb.blockSignals(False)
             color = CHANNEL_COLORS[ch]
             cb.setStyleSheet(
                 f"QCheckBox {{ color: {color}; font-weight: bold; }}"
@@ -83,6 +86,7 @@ class EEGPanel(QWidget):
         self._plot.getAxis("left").setTextPen(pg.mkPen("#888"))
         self._plot.setXRange(0, SWEEP_WINDOW_S, padding=0)
         self._plot.setYRange(CH_YRANGE[0], CH_YRANGE[1], padding=0)
+        self._plot.disableAutoRange()
         self._plot.setMenuEnabled(False)
 
         # Tick marks at y-offsets with channel names
@@ -90,7 +94,6 @@ class EEGPanel(QWidget):
         y_axis.setTicks([[(off, name) for name, off in zip(CH_NAMES, CH_OFFSETS)]])
 
         # One curve per channel
-        self._curves: list[pg.PlotDataItem] = []
         for i, ch in enumerate(CH_NAMES):
             pen = pg.mkPen(color=CHANNEL_COLORS[ch], width=1)
             curve = self._plot.plot(self._x_arr, self._nan_y.copy(), pen=pen, name=ch)
@@ -101,7 +104,7 @@ class EEGPanel(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def update(self, y_sweep: np.ndarray, quality: list[str]):
+    def refresh(self, y_sweep: np.ndarray, quality: list[str]):
         """
         Called by the fast QTimer (10 Hz).
         y_sweep : (SWEEP_SIZE, 5) — raw µV, NaN where no data / eraser gap
@@ -127,6 +130,7 @@ class EEGPanel(QWidget):
         nan_y = self._nan_y.copy()
         for curve in self._curves:
             curve.setData(self._x_arr, nan_y)
+        self._plot.disableAutoRange()
         for lbl in self._quality_labels:
             lbl.setStyleSheet(
                 f"background-color: {QUALITY_COLORS['secondary']}; "

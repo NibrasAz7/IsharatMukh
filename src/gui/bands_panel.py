@@ -114,7 +114,7 @@ class BandsPanel(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def update(self, powers: dict, band_history: dict):
+    def refresh(self, powers: dict, band_history: dict):
         """
         powers       : dict  band_name → ndarray shape (≥4,)  µV²
         band_history : dict  band_name → deque of (timestamp, avg_power)

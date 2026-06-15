@@ -163,7 +163,7 @@ class MentalPanel(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def update(self, metrics: dict, processor):
+    def refresh(self, metrics: dict, processor):
         """
         metrics   : {"workload": float 0-100, "fatigue": float 0-100}
         processor : EEGProcessor (for get_metric_history)
