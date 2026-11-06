@@ -16,11 +16,12 @@ try:
 except ImportError:
     _HAS_SCIPY = False
 
-PPG_CH_NAMES  = ["Ambient", "IR", "Red"]
-PPG_CH_COLORS = {"Ambient": "#888888", "IR": "#ff5555", "Red": "#ff2222"}
-PPG_WINDOW_S  = 10       # seconds shown in sweep
-PPG_FS        = 64       # Hz
-PPG_SWEEP_PTS = PPG_FS * PPG_WINDOW_S   # 640 samples
+PPG_CH_NAMES   = ["Ambient", "IR", "Red"]
+PPG_CH_COLORS  = {"Ambient": "#888888", "IR": "#ff5555", "Red": "#ff2222"}
+PPG_CH_OFFSETS = {"Ambient": 3.5, "IR": 0.0, "Red": -3.5}   # z-score vertical separation
+PPG_WINDOW_S   = 10       # seconds shown in sweep
+PPG_FS         = 64       # Hz
+PPG_SWEEP_PTS  = PPG_FS * PPG_WINDOW_S   # 640 samples
 
 
 class _NumericGauge(QWidget):
@@ -108,10 +109,11 @@ class PPGPanel(QWidget):
         self._sweep.setMouseEnabled(x=False, y=True)
         self._sweep.showGrid(x=True, y=True, alpha=0.2)
         self._sweep.setLabel("bottom", "Time (s)", color="#888")
-        self._sweep.setLabel("left", "PPG (a.u.)", color="#888")
+        self._sweep.setLabel("left", "PPG (z-score)", color="#888")
         self._sweep.getAxis("bottom").setTextPen(pg.mkPen("#888"))
         self._sweep.getAxis("left").setTextPen(pg.mkPen("#888"))
         self._sweep.setXRange(0, PPG_WINDOW_S, padding=0)
+        self._sweep.setYRange(-6, 6, padding=0)
         self._sweep.setMenuEnabled(False)
         self._sweep_curves: dict[str, pg.PlotDataItem] = {}
         for ch in PPG_CH_NAMES:
@@ -171,6 +173,7 @@ class PPGPanel(QWidget):
         """
         ppg_window : (n_samples, 3)  — latest N seconds of PPG (ambient, IR, red)
         n_samples  ≤ PPG_SWEEP_PTS
+        Each channel is z-score normalised and offset vertically for readability.
         """
         n = ppg_window.shape[0]
         for ci, ch in enumerate(PPG_CH_NAMES):
@@ -180,7 +183,11 @@ class PPGPanel(QWidget):
             y = np.full(PPG_SWEEP_PTS, np.nan)
             if n > 0:
                 start = max(0, PPG_SWEEP_PTS - n)
-                y[start:] = ppg_window[-PPG_SWEEP_PTS + start:, ci] if n >= PPG_SWEEP_PTS else ppg_window[:, ci]
+                raw = (ppg_window[-PPG_SWEEP_PTS + start:, ci]
+                       if n >= PPG_SWEEP_PTS else ppg_window[:, ci])
+                mu, sigma = np.mean(raw), np.std(raw)
+                norm = (raw - mu) / sigma if sigma > 1e-6 else np.zeros_like(raw)
+                y[start:] = norm + PPG_CH_OFFSETS[ch]
             self._sweep_curves[ch].setData(self._x_arr, y, connect='finite')
 
     def refresh_metrics(self, hr: float | None, hrv: float | None, t_rel: float):

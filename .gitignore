@@ -24,3 +24,13 @@ BlueMuse-*/
 # OS
 .DS_Store
 Thumbs.db
+
+# Packaging artifacts (spec file stays tracked)
+*.rar
+IsharatMukh-windows-x64-*/
+*.zip
+nul
+
+# Working folders not part of the app
+legacy/
+presentation/

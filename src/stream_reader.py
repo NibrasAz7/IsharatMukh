@@ -82,11 +82,14 @@ class StreamReader:
     # ── Scanning ─────────────────────────────────────────────────────────────────
 
     def scan_devices(self, on_found: Callable[[list], None] | None = None,
-                     timeout: float = SCAN_TIMEOUT) -> None:
+                     timeout: float = SCAN_TIMEOUT,
+                     on_progress: Callable[[list], None] | None = None) -> None:
         """
         Scan for nearby Muse headsets in a background thread.
-        Calls `on_found(devices)` when done, where devices is a list of
-        {"name": str, "address": str} dicts.
+
+        Calls `on_progress(devices)` each time a Muse is discovered (live list
+        updates) and `on_found(devices)` when done, where devices is a list of
+        {"name": str, "address": str, "rssi": int|None} dicts.
         """
         if self._scanning:
             return
@@ -95,15 +98,42 @@ class StreamReader:
 
         def _scan():
             try:
-                from muselsl.stream import list_muses
+                import asyncio
+                from bleak import BleakScanner
+
+                found: dict[str, dict] = {}
+
+                def _cb(device, adv):
+                    if device.name and "Muse" in device.name:
+                        rssi = getattr(adv, "rssi", None) if adv is not None \
+                            else getattr(device, "rssi", None)
+                        found[device.address] = {
+                            "name":    device.name,
+                            "address": device.address,
+                            "rssi":    rssi,
+                        }
+                        if on_progress:
+                            on_progress(list(found.values()))
+
+                async def _run():
+                    scanner = BleakScanner(detection_callback=_cb)
+                    await scanner.start()
+                    await asyncio.sleep(timeout)
+                    await scanner.stop()
+
                 print(f"[StreamReader] Scanning for Muse devices ({timeout:.0f}s)…")
-                devices = list_muses(backend="bleak") or []
-                self.discovered_devices = devices
-                print(f"[StreamReader] Found {len(devices)} device(s): "
-                      f"{[d['name'] for d in devices]}")
+                asyncio.run(_run())
+                self.discovered_devices = list(found.values())
+                print(f"[StreamReader] Found {len(self.discovered_devices)} device(s): "
+                      f"{[d['name'] for d in self.discovered_devices]}")
             except Exception as exc:
-                print(f"[StreamReader] Scan error: {exc}")
-                self.discovered_devices = []
+                print(f"[StreamReader] bleak scan error: {exc} — trying list_muses")
+                try:
+                    from muselsl.stream import list_muses
+                    self.discovered_devices = list_muses(backend="bleak") or []
+                except Exception as exc2:
+                    print(f"[StreamReader] Scan error: {exc2}")
+                    self.discovered_devices = []
             finally:
                 self._scanning = False
                 if on_found:
@@ -245,6 +275,11 @@ class StreamReader:
 
     # ── Public data API ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def now() -> float:
+        """Current time on this reader's clock — use for marker timestamps."""
+        return time.time()
+
     @property
     def is_connected(self) -> bool:
         return self._connected
@@ -322,6 +357,16 @@ class StreamReader:
             if n_new <= 0:
                 return np.empty((0, PPG_CHANNEL_COUNT)), np.empty(0)
             items = list(self._ppg_buffer)[-n_new:]
+        timestamps = np.array([it[0] for it in items])
+        data       = np.array([it[1] for it in items])
+        return data, timestamps
+
+    def get_all_ppg(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the entire PPG buffer (up to BUFFER_SECONDS)."""
+        with self._ppg_lock:
+            items = list(self._ppg_buffer)
+        if not items:
+            return np.empty((0, PPG_CHANNEL_COUNT)), np.empty(0)
         timestamps = np.array([it[0] for it in items])
         data       = np.array([it[1] for it in items])
         return data, timestamps

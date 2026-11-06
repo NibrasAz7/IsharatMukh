@@ -29,7 +29,18 @@ METRICS = [
     ("faa",       "#88dd66", "Approach / Withdrawal",  "ln(α_AF8)−ln(α_AF7)   50=neutral"),
 ]
 
-HIGH_THRESHOLD = 75   # % above which fill opacity increases and gauge turns red
+HIGH_THRESHOLD = 75   # % above which the gauge turns red and vertical bands appear
+
+
+def _update_area_fills(pw, t_rel: np.ndarray, vals: np.ndarray) -> None:
+    """
+    Drive both fill curves on `pw`:
+      base_fill  — always visible, slightly transparent (below-threshold look)
+      thresh_fill — solid, only where vals >= HIGH_THRESHOLD (on top of base)
+    """
+    pw._base_fill.setData(t_rel, vals)
+    y_masked = np.where(vals >= HIGH_THRESHOLD, vals, np.nan)
+    pw._thresh_fill.setData(t_rel, y_masked)
 
 
 class _GaugeWidget(QWidget):
@@ -188,13 +199,34 @@ class MentalPanel(QWidget):
             )
             pw.addItem(thresh)
 
-        pen  = pg.mkPen(color=color, width=1.5)
-        fill = pg.mkBrush(color + "33")
-        curve = pw.plot([], [], pen=pen, fillLevel=0, brush=fill)
+        pen = pg.mkPen(color=color, width=1.5)
+        curve = pw.plot([], [], pen=pen)
+
+        base_fill = pw.plot(
+            [], [],
+            pen=pg.mkPen(None),
+            fillLevel=0,
+            brush=pg.mkBrush(color + "2a"),
+            connect="finite",
+        )
+        base_fill.setZValue(-6)
+
+        thresh_fill = pw.plot(
+            [], [],
+            pen=pg.mkPen(None),
+            fillLevel=0,
+            brush=pg.mkBrush(color + "bb"),
+            connect="finite",
+        )
+        thresh_fill.setZValue(-5)
+
         pw.getAxis("bottom").setStyle(showValues=False)   # hide x labels except bottom
         self._hist_curves[f"_curve_{id(pw)}"] = curve
-        pw._metric_curve = curve
-        pw._metric_color = color
+        pw._metric_curve  = curve
+        pw._metric_color  = color
+        pw._is_faa        = is_faa
+        pw._base_fill     = base_fill
+        pw._thresh_fill   = thresh_fill
         return pw
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -218,15 +250,9 @@ class MentalPanel(QWidget):
             t_rel = ts - ts[0]
             pw._metric_curve.setData(t_rel, vals)
 
-            # Dynamic fill opacity: rises when current value > threshold
-            current = metrics.get(key, 0.0)
-            if current >= HIGH_THRESHOLD:
-                opacity = "aa"   # ~67 % opaque
-            elif current >= 50:
-                opacity = "66"   # ~40 %
-            else:
-                opacity = "22"   # ~13 %
-            pw._metric_curve.setBrush(pg.mkBrush(pw._metric_color + opacity))
+            # Fill: subtle always-on base + solid overlay where threshold exceeded
+            if not pw._is_faa:
+                _update_area_fills(pw, t_rel, vals)
 
         # Show x-axis labels only on the bottom-most plot
         for key, _c, _t, _d in METRICS:

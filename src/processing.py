@@ -53,9 +53,12 @@ class EEGProcessor:
     """
 
     def __init__(self, sample_rate: float = SAMPLE_RATE, notch_freq: float = 50.0):
-        self.fs        = sample_rate
-        self._bp_sos   = _bandpass_sos(0.5, 45.0, sample_rate)
-        self._notch_sos = _notch_sos(notch_freq, sample_rate)
+        self.fs              = sample_rate
+        self.filter_low      = 0.5
+        self.filter_high     = 45.0
+        self.notch_freq      = notch_freq
+        self.filters_enabled = True
+        self._rebuild_filters()
 
         # Rolling metric history  {metric_name: deque of (time, value)}
         _metrics = ("workload", "fatigue", "stress", "attention", "faa")
@@ -71,12 +74,38 @@ class EEGProcessor:
 
     # ── Filtering ───────────────────────────────────────────────────────────────
 
+    def _rebuild_filters(self):
+        self._bp_sos    = _bandpass_sos(self.filter_low, self.filter_high, self.fs)
+        self._notch_sos = _notch_sos(self.notch_freq, self.fs)
+
+    def configure_filters(self, low_hz: float | None = None,
+                          high_hz: float | None = None,
+                          notch_hz: float | None = None,
+                          enabled: bool | None = None):
+        """
+        Update real-time filter parameters (bandpass low/high cutoff, notch freq,
+        master enable).  Callers must reset causal filter states afterwards.
+        Raises ValueError on an invalid band.
+        """
+        low   = self.filter_low  if low_hz   is None else float(low_hz)
+        high  = self.filter_high if high_hz  is None else float(high_hz)
+        notch = self.notch_freq  if notch_hz is None else float(notch_hz)
+        nyq   = self.fs / 2.0
+        if not (0.01 <= low < high < nyq):
+            raise ValueError(
+                f"Invalid band {low:g}–{high:g} Hz (Nyquist {nyq:g} Hz)"
+            )
+        self.filter_low, self.filter_high, self.notch_freq = low, high, notch
+        if enabled is not None:
+            self.filters_enabled = bool(enabled)
+        self._rebuild_filters()
+
     def filter_signal(self, data: np.ndarray) -> np.ndarray:
         """
         Apply bandpass + notch filter to a (n_samples, n_channels) array.
         Zero-phase (sosfiltfilt) — use for offline/epoch processing only.
         """
-        if data.shape[0] < 10:
+        if data.shape[0] < 10 or not self.filters_enabled:
             return data
         filtered = sosfiltfilt(self._bp_sos,   data, axis=0)
         filtered = sosfiltfilt(self._notch_sos, filtered, axis=0)
@@ -87,8 +116,8 @@ class EEGProcessor:
         zi_bp    = sosfilt_zi(self._bp_sos)
         zi_notch = sosfilt_zi(self._notch_sos)
         return {
-            "bp":    np.zeros((zi_bp.shape[0],    n_channels, 2)),
-            "notch": np.zeros((zi_notch.shape[0], n_channels, 2)),
+            "bp":    np.zeros((zi_bp.shape[0],    2, n_channels)),
+            "notch": np.zeros((zi_notch.shape[0], 2, n_channels)),
         }
 
     def filter_new(self, data: np.ndarray, states: dict) -> tuple[np.ndarray, dict]:
@@ -105,7 +134,7 @@ class EEGProcessor:
         filtered : (n_new_samples, n_channels)
         states   : updated states (mutated in-place and returned)
         """
-        if data.shape[0] == 0:
+        if data.shape[0] == 0 or not self.filters_enabled:
             return data, states
         y, zi_bp    = sosfilt(self._bp_sos,    data, axis=0, zi=states["bp"])
         y, zi_notch = sosfilt(self._notch_sos, y,    axis=0, zi=states["notch"])
@@ -229,20 +258,50 @@ class EEGProcessor:
         Return a quality label per channel: 'good', 'fair', or 'poor'.
         Based on amplitude RMS (too low = contact issue, too high = artifact).
         """
+        return [s["label"] for s in self.channel_stats(data)]
+
+    def channel_stats(self, data: np.ndarray) -> list[dict]:
+        """
+        Per-channel contact-quality stats for the electrode-health readouts.
+
+        Returns one dict per channel:
+            {"rms": µV RMS, "line_noise": µV RMS in ±2 Hz around the notch
+             frequency, "label": 'good'|'fair'|'poor'}
+
+        NOTE: the Muse S does not expose true electrode impedance over BLE via
+        muselsl — rms/line_noise are a contact-quality proxy, not impedance.
+        """
+        n_ch = data.shape[1] if data.ndim == 2 else 1
         if data.shape[0] == 0:
-            return ["poor"] * data.shape[1] if data.ndim == 2 else ["poor"]
+            return [{"rms": 0.0, "line_noise": 0.0, "label": "poor"}] * n_ch
+
         rms = np.sqrt(np.mean(data ** 2, axis=0))
-        labels = []
-        for r in rms:
-            if r < 1.0:
-                labels.append("poor")
+
+        # Line-noise estimate: integrate Welch PSD in a ±2 Hz band around the
+        # configured notch (powerline) frequency.
+        from scipy.signal import welch
+        line = np.zeros(n_ch)
+        if data.shape[0] >= int(self.fs // 2):
+            freqs, psd = welch(data, fs=self.fs,
+                               nperseg=int(self.fs // 2), axis=0)
+            band = np.where((freqs >= self.notch_freq - 2.0)
+                            & (freqs <= self.notch_freq + 2.0))[0]
+            if len(band):
+                df    = freqs[1] - freqs[0] if len(freqs) > 1 else 1.0
+                line  = np.sqrt(np.sum(psd[band, :], axis=0) * df)
+
+        stats = []
+        for i in range(n_ch):
+            r = rms[i] if i < len(rms) else 0.0
+            if r < 1.0 or r >= 150.0:
+                label = "poor"          # no contact / saturated
             elif r < 5.0:
-                labels.append("fair")
-            elif r < 150.0:
-                labels.append("good")
+                label = "fair"
             else:
-                labels.append("poor")   # saturated / artifact
-        return labels
+                label = "good"
+            stats.append({"rms": float(r), "line_noise": float(line[i]),
+                          "label": label})
+        return stats
 
     # ── Private ─────────────────────────────────────────────────────────────────
 

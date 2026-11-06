@@ -7,7 +7,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
 from src.gui.theme import (
@@ -26,9 +26,10 @@ class EEGPanel(QWidget):
         super().__init__(parent)
         self._x_arr = np.linspace(0, SWEEP_WINDOW_S, SWEEP_SIZE)
         self._nan_y = np.full(SWEEP_SIZE, np.nan)
-        self._sim_phase  = 0.0      # simulation phase accumulator
-        self._sim_active = False
-        self._sim_timer  = QTimer(self)
+        self._sim_phase    = 0.0
+        self._sim_active  = False
+        self._display_mode = 'scroll'   # 'scroll' | 'sweep'
+        self._sim_timer   = QTimer(self)
         self._sim_timer.setInterval(100)
         self._sim_timer.timeout.connect(self._sim_tick)
         self._setup_ui()
@@ -64,10 +65,15 @@ class EEGPanel(QWidget):
         quality_row.addWidget(QLabel("Signal:"))
         self._quality_labels: list[QLabel] = []
         for ch in CH_NAMES[:4]:
-            lbl = QLabel(ch)
+            lbl = QLabel(f"{ch}\n—")
             lbl.setObjectName("status-label")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setFixedWidth(50)
+            lbl.setFixedWidth(58)
+            lbl.setToolTip(
+                "Contact-quality estimate (µV RMS of filtered signal).\n"
+                "Proxy for electrode contact — true impedance is not "
+                "exposed by the Muse S over BLE."
+            )
             lbl.setStyleSheet(
                 f"background-color: {QUALITY_COLORS['secondary']}; "
                 "border-radius: 4px; padding: 2px 4px; color: white; font-weight: bold;"
@@ -83,6 +89,17 @@ class EEGPanel(QWidget):
         self._sim_btn.clicked.connect(self._on_simulate_toggle)
         quality_row.addWidget(self._sim_btn)
 
+        quality_row.addWidget(QLabel("Mode:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItems(["Scrolling", "Sweep"])
+        self._mode_combo.setFixedWidth(90)
+        self._mode_combo.setToolTip(
+            "Scrolling: latest data always on the right.\n"
+            "Sweep: draw-and-erase ECG-style cursor."
+        )
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_change)
+        quality_row.addWidget(self._mode_combo)
+
         top_row = QHBoxLayout()
         top_row.addLayout(toggle_row)
         top_row.addLayout(quality_row)
@@ -90,7 +107,7 @@ class EEGPanel(QWidget):
 
         # ── Sweep plot ────────────────────────────────────────────────────────
         self._plot = pg.PlotWidget(background="#111111")
-        self._plot.setMouseEnabled(x=False, y=False)
+        self._plot.setMouseEnabled(x=True, y=False)   # allow x pan/zoom; y is locked
         self._plot.showGrid(x=True, y=True, alpha=0.2)
         self._plot.setLabel("bottom", "Time (s)", color="#888")
         self._plot.setLabel("left", "µV (offset per channel)", color="#888")
@@ -117,11 +134,16 @@ class EEGPanel(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def refresh(self, y_sweep: np.ndarray, quality: list[str]):
+    @property
+    def display_mode(self) -> str:
+        """'scroll' or 'sweep'."""
+        return self._display_mode
+
+    def refresh(self, y_sweep: np.ndarray, stats: list[dict]):
         """
         Called by the fast QTimer (10 Hz).
         y_sweep : (SWEEP_SIZE, 5) — raw µV, NaN where no data / eraser gap
-        quality : list of 4 labels ('good'/'fair'/'poor')
+        stats   : list of 4 dicts {"rms", "line_noise", "label"}
         """
         if self._sim_active:
             return   # simulation drives the curves directly
@@ -133,8 +155,10 @@ class EEGPanel(QWidget):
             y[mask] += CH_OFFSETS[i]
             self._curves[i].setData(self._x_arr, y, connect='finite')
 
-        for i, (lbl, q) in enumerate(zip(self._quality_labels, quality)):
-            color = QUALITY_COLORS.get(q, QUALITY_COLORS["secondary"])
+        for i, (lbl, s) in enumerate(zip(self._quality_labels, stats)):
+            color = QUALITY_COLORS.get(s.get("label", "poor"),
+                                       QUALITY_COLORS["secondary"])
+            lbl.setText(f"{CH_NAMES[i]}\n{s.get('rms', 0.0):.0f} µV")
             lbl.setStyleSheet(
                 f"background-color: {color}; "
                 "border-radius: 4px; padding: 2px 4px; color: white; font-weight: bold;"
@@ -146,7 +170,8 @@ class EEGPanel(QWidget):
         for curve in self._curves:
             curve.setData(self._x_arr, nan_y)
         self._plot.disableAutoRange()
-        for lbl in self._quality_labels:
+        for i, lbl in enumerate(self._quality_labels):
+            lbl.setText(f"{CH_NAMES[i]}\n—")
             lbl.setStyleSheet(
                 f"background-color: {QUALITY_COLORS['secondary']}; "
                 "border-radius: 4px; padding: 2px 4px; color: white; font-weight: bold;"
@@ -157,6 +182,9 @@ class EEGPanel(QWidget):
     def _on_toggle(self, ch_idx: int, state: int):
         visible = state == Qt.CheckState.Checked.value
         self._curves[ch_idx].setVisible(visible)
+
+    def _on_mode_change(self, index: int):
+        self._display_mode = 'scroll' if index == 0 else 'sweep'
 
     def _on_simulate_toggle(self, checked: bool):
         self._sim_active = checked
