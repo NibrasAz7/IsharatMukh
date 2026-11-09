@@ -833,11 +833,9 @@ class MainWindow(QMainWindow):
             }
             metric_h = {k: v for k, v in metric_h.items() if v} or None
 
-        # Markers: window to the session when we have one
+        # Markers are annotations, not signal — save ALL events fired since
+        # the last clear/connect, including pre-roll and post-stop ones.
         marker_events = list(self._marker_events)
-        if t_lo is not None:
-            marker_events = [(t, l) for t, l in marker_events
-                             if t_lo <= t <= t_hi]
 
         ppg_ok = inc.get("ppg", True) and ppg_data.shape[0] > 0
 
