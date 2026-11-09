@@ -42,7 +42,8 @@ class MarkerDialog(QDialog):
             QListWidget.EditTrigger.DoubleClicked |
             QListWidget.EditTrigger.EditKeyPressed)
         for d in self._defs:
-            QListWidgetItem(d, self._def_list)
+            item = QListWidgetItem(d, self._def_list)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
         root.addWidget(self._def_list, stretch=1)
 
         drow = QHBoxLayout()
