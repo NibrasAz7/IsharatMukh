@@ -117,6 +117,28 @@ def save_session_csv(
     return str(csv_path)
 
 
+def save_markers_only(
+    marker_events: list[tuple[float, str]],
+    meta: dict,
+    save_path: str | Path | None = None,
+) -> dict[str, str]:
+    """
+    Persist marker events + metadata when there is no signal data to save
+    (e.g. markers fired without a recording). Writes <stem>_events.tsv and
+    <stem>_meta.json only.
+    """
+    out_dir = Path(save_path) if save_path else None
+    out_dir, stem = _resolve_out(out_dir, None)
+    mts = np.array(sorted(t for t, _ in marker_events)) \
+        if marker_events else np.empty(0)
+    result = {"events_tsv": save_events_tsv(
+        mts, marker_events, stem=stem, out_dir=out_dir)}
+    meta = dict(meta)
+    meta["files"] = {k: os.path.basename(v) for k, v in result.items()}
+    result["meta"] = save_meta_json(meta, stem=stem, out_dir=out_dir)
+    return result
+
+
 # ── JSON metadata sidecar ────────────────────────────────────────────────────────
 
 def save_meta_json(meta: dict, stem: str | None = None,

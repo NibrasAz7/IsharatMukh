@@ -773,7 +773,10 @@ class MainWindow(QMainWindow):
         if not self._settings.get("autosave", True):
             return
         sess = self._session
-        if sess is None or sess["eeg_data"].shape[0] == 0:
+        has_sig = (sess is not None
+                   and (sess["eeg_data"].shape[0] > 0
+                        or sess["ppg_data"].shape[0] > 0))
+        if not has_sig and not self._marker_events:
             return
         try:
             self._save_data(autosaved=True)
@@ -807,8 +810,31 @@ class MainWindow(QMainWindow):
             t_lo = t_hi = None
             rec_meta = None
 
+        # Markers are annotations, not signal — save ALL events fired since
+        # the last clear/connect, including pre-roll and post-stop ones.
+        marker_events = list(self._marker_events)
+
         if data.shape[0] == 0 and ppg_data.shape[0] == 0:
-            self._save_status.setText("⚠ No data to save.")
+            if not marker_events:
+                self._save_status.setText("⚠ No data to save.")
+                return
+            # No signal but markers exist — never drop them
+            from src.data_manager import save_markers_only
+            meta = {
+                "app": {"name": "IsharatMukh", "version": APP_VERSION},
+                "session_source": ("BLE" if self._reader is self._ble_reader
+                                   else "LSL"),
+                "markers": {
+                    "defs":   list(self._marker_defs),
+                    "events": [{"t": t, "label": l} for t, l in marker_events],
+                },
+                "note": "markers-only export — no EEG/PPG signal was recorded",
+            }
+            saved = save_markers_only(
+                marker_events, meta, save_path=s.get("path"))
+            self._save_status.setText(
+                f"✓ Saved markers only — {len(marker_events)} event(s)\n"
+                f"{saved.get('events_tsv', '')}")
             return
 
         # EEG channel selection (first 4 cols = TP9/AF7/AF8/TP10)
@@ -832,10 +858,6 @@ class MainWindow(QMainWindow):
                 for k in self._processor.metric_history
             }
             metric_h = {k: v for k, v in metric_h.items() if v} or None
-
-        # Markers are annotations, not signal — save ALL events fired since
-        # the last clear/connect, including pre-roll and post-stop ones.
-        marker_events = list(self._marker_events)
 
         ppg_ok = inc.get("ppg", True) and ppg_data.shape[0] > 0
 
