@@ -77,7 +77,7 @@ class MarkerDialog(QDialog):
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
+        btns.accepted.connect(self._accept)
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
 
