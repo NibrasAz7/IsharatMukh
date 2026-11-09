@@ -29,17 +29,18 @@ METRICS = [
     ("faa",       "#88dd66", "Approach / Withdrawal",  "ln(α_AF8)−ln(α_AF7)   50=neutral"),
 ]
 
-HIGH_THRESHOLD = 75   # % above which the gauge turns red and vertical bands appear
+DEFAULT_THRESHOLD = 75.0   # % above which the gauge turns red
 
 
-def _update_area_fills(pw, t_rel: np.ndarray, vals: np.ndarray) -> None:
+def _update_area_fills(pw, t_rel: np.ndarray, vals: np.ndarray,
+                       threshold: float) -> None:
     """
     Drive both fill curves on `pw`:
       base_fill  — always visible, slightly transparent (below-threshold look)
-      thresh_fill — solid, only where vals >= HIGH_THRESHOLD (on top of base)
+      thresh_fill — solid, only where vals >= threshold (on top of base)
     """
     pw._base_fill.setData(t_rel, vals)
-    y_masked = np.where(vals >= HIGH_THRESHOLD, vals, np.nan)
+    y_masked = np.where(vals >= threshold, vals, np.nan)
     pw._thresh_fill.setData(t_rel, y_masked)
 
 
@@ -76,11 +77,11 @@ class _GaugeWidget(QWidget):
         layout.addLayout(bar_row, stretch=1)
         layout.addWidget(self._value_lbl)
 
-    def set_value(self, value: float):
+    def set_value(self, value: float, threshold: float = DEFAULT_THRESHOLD):
         v = int(round(max(0, min(100, value))))
         self._bar.setValue(v)
         self._value_lbl.setText(str(v))
-        chunk_color = "#ff3333" if v >= HIGH_THRESHOLD else (
+        chunk_color = "#ff3333" if v >= threshold else (
             "#f1a24e" if v >= 50 else self._base_color
         )
         self._apply_style(chunk_color)
@@ -105,7 +106,17 @@ class MentalPanel(QWidget):
         self._hist_plots: dict[str, pg.PlotWidget] = {}
         self._hist_curves: dict[str, pg.PlotDataItem] = {}
         self._ref_plot: pg.PlotWidget | None = None   # x-axis link reference
+        self._thresholds: dict[str, float] = {
+            k: DEFAULT_THRESHOLD for k, *_ in METRICS
+        }
+        self._thresh_lines: dict[str, pg.InfiniteLine] = {}
         self._setup_ui()
+
+    def set_thresholds(self, thresholds: dict[str, float]):
+        """Update per-metric 'high' thresholds (0–100)."""
+        self._thresholds.update(thresholds)
+        for key, line in self._thresh_lines.items():
+            line.setPos(self._thresholds.get(key, DEFAULT_THRESHOLD))
 
     # ─────────────────────────────────────────────────────────────────────────
     # UI construction
@@ -158,7 +169,7 @@ class MentalPanel(QWidget):
         vsplit = QSplitter(Qt.Orientation.Vertical)
 
         for key, color, title, _desc in METRICS:
-            pw = self._make_hist_plot(title, color, key == "faa")
+            pw = self._make_hist_plot(title, color, key == "faa", key)
             if self._ref_plot is None:
                 self._ref_plot = pw
             else:
@@ -172,7 +183,8 @@ class MentalPanel(QWidget):
 
         root.addWidget(vsplit, stretch=1)
 
-    def _make_hist_plot(self, title: str, color: str, is_faa: bool = False) -> pg.PlotWidget:
+    def _make_hist_plot(self, title: str, color: str, is_faa: bool,
+                        metric_key: str) -> pg.PlotWidget:
         pw = pg.PlotWidget(background="#111111")
         pw.setMenuEnabled(False)
         pw.setMouseEnabled(x=True, y=True)   # navigation enabled
@@ -193,11 +205,13 @@ class MentalPanel(QWidget):
         else:
             pw.setYRange(0, 100, padding=0.05)
             thresh = pg.InfiniteLine(
-                pos=HIGH_THRESHOLD, angle=0,
+                pos=self._thresholds.get(metric_key, DEFAULT_THRESHOLD),
+                angle=0,
                 pen=pg.mkPen("#ff6666", width=1, style=Qt.PenStyle.DashLine),
                 label="High", labelOpts={"color": "#ff6666", "position": 0.98},
             )
             pw.addItem(thresh)
+            self._thresh_lines[metric_key] = thresh
 
         pen = pg.mkPen(color=color, width=1.5)
         curve = pw.plot([], [], pen=pen)
@@ -241,7 +255,8 @@ class MentalPanel(QWidget):
         """
         for key, _color, _title, _desc in METRICS:
             val = metrics.get(key, 0.0)
-            self._gauges[key].set_value(val)
+            thr = self._thresholds.get(key, DEFAULT_THRESHOLD)
+            self._gauges[key].set_value(val, threshold=thr)
 
             pw = self._hist_plots[key]
             ts, vals = processor.get_metric_history(key)
@@ -252,7 +267,7 @@ class MentalPanel(QWidget):
 
             # Fill: subtle always-on base + solid overlay where threshold exceeded
             if not pw._is_faa:
-                _update_area_fills(pw, t_rel, vals)
+                _update_area_fills(pw, t_rel, vals, thr)
 
         # Show x-axis labels only on the bottom-most plot
         for key, _c, _t, _d in METRICS:

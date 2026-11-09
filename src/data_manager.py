@@ -15,7 +15,7 @@ import pandas as pd
 DATA_DIR = Path(__file__).parent.parent / "data"
 
 ALL_METRICS = ("workload", "fatigue", "stress", "attention", "faa")
-HIGH_THRESHOLD = 75    # must match mental_panel.HIGH_THRESHOLD
+DEFAULT_THRESHOLDS = {m: 75.0 for m in ALL_METRICS}
 
 
 def _ensure_data_dir() -> Path:
@@ -41,11 +41,12 @@ def _resolve_out(out_dir, stem):
 def save_session_csv(
     timestamps: np.ndarray,
     raw_data:   np.ndarray,
-    filtered_data: np.ndarray | None = None,
+    filtered_banks: dict[str, np.ndarray] | None = None,
     metric_history: dict | None = None,
     marker_events: list[tuple[float, str]] | None = None,
     channel_names: list[str] | None = None,
     threshold_flag: bool = True,
+    thresholds: dict[str, float] | None = None,
     stem: str | None = None,
     out_dir: Path | None = None,
 ) -> str:
@@ -57,11 +58,11 @@ def save_session_csv(
     timestamp        : Unix timestamp per EEG sample
     marker           : trigger label on the nearest sample row (empty otherwise)
     raw_<CH>         : raw µV per channel
-    filt_<CH>        : filtered µV per channel (if filtered_data given)
+    filt_<bank>_<CH> : filtered µV per channel, one column set per filter bank
     workload, fatigue, stress, attention, faa
                      : mental metrics — SPARSE (values only at their ~2 s
                        epoch timestamps, NaN between samples)
-    above_threshold  : 1 on epoch rows where any metric >= HIGH_THRESHOLD
+    above_threshold  : 1 on epoch rows where any metric >= its threshold
 
     Returns absolute path of the saved file.
     """
@@ -83,21 +84,26 @@ def save_session_csv(
             marker[idx] = f"{marker[idx]};{label}" if marker[idx] else label
     df.insert(1, "marker", marker)
 
-    if filtered_data is not None and filtered_data.shape == raw_data.shape:
-        for i, c in enumerate(ch_names):
-            df[f"filt_{c}"] = filtered_data[:, i]
+    thresholds = thresholds or DEFAULT_THRESHOLDS
+
+    for bank_name, fdata in (filtered_banks or {}).items():
+        if fdata.shape == raw_data.shape:
+            tag = str(bank_name).replace(" ", "_").replace("/", "-")
+            for i, c in enumerate(ch_names):
+                df[f"filt_{tag}_{c}"] = fdata[:, i]
 
     if metric_history:
         epoch_idx: set[int] = set()
         thresh_col = np.full(n, np.nan)
         for m in ALL_METRICS:
             col = np.full(n, np.nan)
+            thr = float(thresholds.get(m, 75.0))
             for ts, val in metric_history.get(m, []):
                 idx = int(np.searchsorted(timestamps, ts))
                 if 0 <= idx < n:
                     col[idx] = val
                     epoch_idx.add(idx)
-                    if val >= HIGH_THRESHOLD:
+                    if val >= thr:
                         thresh_col[idx] = 1.0
             df[m] = col
         if threshold_flag:
@@ -300,7 +306,7 @@ def save_fif(
 def save_recording(
     timestamps: np.ndarray,
     raw_data:   np.ndarray,
-    filtered_data: np.ndarray | None = None,
+    filtered_banks: dict[str, np.ndarray] | None = None,
     sample_rate: float = 256.0,
     metric_history: dict | None = None,
     marker_events: list[tuple[float, str]] | None = None,
@@ -311,12 +317,17 @@ def save_recording(
     save_path: str | Path | None = None,
     formats: set | None = None,
     threshold_flag: bool = True,
+    thresholds: dict[str, float] | None = None,
+    record_meta: dict | None = None,
+    epoch_pad_s: float = 0.5,
 ) -> dict[str, str]:
     """
-    Save a full session: combined CSV, JSON metadata, optional EDF and PPG CSV.
+    Save a full session: combined CSV, epochs table, JSON metadata,
+    optional EDF/FIF/events/PPG exports.
 
-    Returns dict with keys 'csv', 'meta', 'edf', 'ppg_csv' depending on
-    formats/data provided.
+    `filtered_banks` maps bank name → filtered (n_samples, n_ch) array;
+    each becomes filt_<bank>_<CH> columns in the CSV.
+    `record_meta` (recording start/stop/duration) is merged into meta.json.
     """
     if formats is None:
         formats = {"csv", "edf"}
@@ -327,21 +338,44 @@ def save_recording(
     if "csv" in formats:
         result["csv"] = save_session_csv(
             timestamps, raw_data,
-            filtered_data=filtered_data,
+            filtered_banks=filtered_banks,
             metric_history=metric_history,
             marker_events=marker_events,
             channel_names=channel_names,
             threshold_flag=threshold_flag,
+            thresholds=thresholds,
             stem=stem,
             out_dir=out_dir,
         )
+    # Epochs table whenever we have metric history (independent of formats —
+    # it derives from the metric columns, not a signal format)
+    if metric_history:
+        try:
+            from src.epochs import find_epochs
+            t0 = float(timestamps[0]) if len(timestamps) else None
+            rows = find_epochs(metric_history, thresholds=thresholds,
+                               pad_s=epoch_pad_s, t0=t0)
+            if rows:
+                ep_path = (out_dir or _ensure_data_dir()) / f"{stem}_epochs.csv"
+                pd.DataFrame(rows).to_csv(ep_path, index=False)
+                result["epochs"] = str(ep_path)
+                if meta is not None:
+                    meta = dict(meta)
+                    meta["epochs"] = {"n_epochs": len(rows), "pad_s": epoch_pad_s,
+                                      "rule": "any metric >= its threshold"}
+        except Exception as exc:
+            print(f"[DataManager] epoch extraction failed: {exc}")
     if "edf" in formats:
-        filt = (meta or {}).get("filters", {})
-        prefilter = (
-            f"HP:{filt.get('low_hz')}Hz LP:{filt.get('high_hz')}Hz "
-            f"N:{filt.get('notch_hz')}Hz"
-            if filt.get("enabled") else "none"
-        )
+        proc = (meta or {}).get("processing", {})
+        banks = {b.get("name"): b for b in proc.get("filter_banks", [])}
+        active = banks.get(proc.get("active_bank", ""), {})
+        stages = [s for s in active.get("stages", []) if s.get("enabled")]
+        if stages:
+            prefilter = "; ".join(
+                f"{s['kind']}:{s.get('low', s.get('freq', s.get('high', '')))}"
+                for s in stages)
+        else:
+            prefilter = "none"
         result["edf"] = save_edf(
             timestamps, raw_data,
             sample_rate=sample_rate,
@@ -369,6 +403,8 @@ def save_recording(
                                           out_dir=out_dir)
     if meta is not None:
         meta = dict(meta)
+        if record_meta:
+            meta["recording"] = record_meta
         meta["files"] = {k: os.path.basename(v) for k, v in result.items() if v}
         result["meta"] = save_meta_json(meta, stem=stem, out_dir=out_dir)
     return result

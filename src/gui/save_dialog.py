@@ -14,7 +14,6 @@ from PyQt6.QtWidgets import (
 )
 
 EEG_CHANNELS   = ["TP9", "AF7", "AF8", "TP10"]
-HIGH_THRESHOLD = 75   # must match mental_panel.HIGH_THRESHOLD
 
 
 class SaveSettingsDialog(QDialog):
@@ -89,7 +88,7 @@ class SaveSettingsDialog(QDialog):
 
         # Other include options
         self._cb_filtered = QCheckBox(
-            "Filtered EEG columns  (filt_<CH> alongside raw_<CH>)"
+            "Filtered EEG columns  (filt_<bank>_<CH> per filter bank)"
         )
         self._cb_mental = QCheckBox(
             "Mental state metrics  (workload, fatigue, stress, attention, FAA)"
@@ -97,7 +96,7 @@ class SaveSettingsDialog(QDialog):
         self._cb_markers = QCheckBox("Marker / trigger column + events")
         self._cb_ppg    = QCheckBox("PPG  (Ambient, IR, Red — separate CSV)")
         self._cb_thresh = QCheckBox(
-            f"Threshold-exceeded flag  (1 when any metric ≥ {HIGH_THRESHOLD})"
+            "Threshold-exceeded flag  (1 when any metric ≥ its threshold)"
         )
         self._cb_filtered.setChecked(inc.get("filtered", True))
         self._cb_mental.setChecked(inc.get("mental", True))

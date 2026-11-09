@@ -8,6 +8,7 @@ raw µV  →  bandpass 0.5–45 Hz  →  notch 50/60 Hz  →  band powers  →  
 """
 
 from collections import deque
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.signal import butter, sosfilt, sosfilt_zi, iirnotch, sosfiltfilt
@@ -29,6 +30,94 @@ SAMPLE_RATE     = 256.0           # Hz
 BASELINE_SECONDS    = 30          # collect this many seconds before normalising
 METRIC_HISTORY_MAX  = 3600        # keep up to 1 h of metric history
 
+# ── Filter banks ────────────────────────────────────────────────────────────────
+
+STAGE_KINDS = ("bandpass", "notch", "highpass", "lowpass")
+
+# Quick-add band buttons in the filter dialog
+BAND_PRESETS = {
+    "Delta":  (0.5, 4.0),
+    "Theta":  (4.0, 8.0),
+    "Alpha":  (8.0, 13.0),
+    "Beta":   (13.0, 30.0),
+    "Gamma":  (30.0, 45.0),
+}
+
+# Named one-click bank presets
+FILTER_PRESETS = {
+    "Cleaning (0.5–45 Hz + notch)": [
+        {"kind": "bandpass", "low": 0.5, "high": 45.0, "enabled": True},
+        {"kind": "notch",    "freq": 50.0, "enabled": True},
+    ],
+    "Delta 0.5–4 Hz":   [{"kind": "bandpass", "low": 0.5, "high": 4.0,  "enabled": True}],
+    "Theta 4–8 Hz":     [{"kind": "bandpass", "low": 4.0, "high": 8.0,  "enabled": True}],
+    "Alpha 8–13 Hz":    [{"kind": "bandpass", "low": 8.0, "high": 13.0, "enabled": True}],
+    "Beta 13–30 Hz":    [{"kind": "bandpass", "low": 13.0, "high": 30.0, "enabled": True}],
+    "Gamma 30–45 Hz":   [{"kind": "bandpass", "low": 30.0, "high": 45.0, "enabled": True}],
+    "EMG clean (>20 Hz)": [
+        {"kind": "highpass", "low": 20.0, "enabled": True},
+        {"kind": "notch",    "freq": 50.0, "enabled": True},
+    ],
+    "Wideband 1–40 Hz": [
+        {"kind": "bandpass", "low": 1.0, "high": 40.0, "enabled": True},
+    ],
+}
+
+
+@dataclass
+class FilterStage:
+    """One filter stage inside a bank."""
+    kind: str = "bandpass"          # bandpass | notch | highpass | lowpass
+    low: float = 0.5                # bandpass/highpass lower cutoff (Hz)
+    high: float = 45.0              # bandpass/lowpass upper cutoff (Hz)
+    freq: float = 50.0              # notch centre frequency (Hz)
+    enabled: bool = True
+
+    def describe(self) -> str:
+        mark = "✓" if self.enabled else "·"
+        if self.kind == "bandpass":
+            return f"{mark} Bandpass {self.low:g}–{self.high:g} Hz"
+        if self.kind == "notch":
+            return f"{mark} Notch {self.freq:g} Hz"
+        if self.kind == "highpass":
+            return f"{mark} Highpass {self.low:g} Hz"
+        return f"{mark} Lowpass {self.high:g} Hz"
+
+    def to_dict(self) -> dict:
+        return {"kind": self.kind, "low": self.low, "high": self.high,
+                "freq": self.freq, "enabled": self.enabled}
+
+    @staticmethod
+    def from_dict(d: dict) -> "FilterStage":
+        return FilterStage(
+            kind=str(d.get("kind", "bandpass")),
+            low=float(d.get("low", 0.5)),
+            high=float(d.get("high", 45.0)),
+            freq=float(d.get("freq", 50.0)),
+            enabled=bool(d.get("enabled", True)),
+        )
+
+
+@dataclass
+class FilterBank:
+    """A named, ordered chain of filter stages."""
+    name: str
+    stages: list = field(default_factory=list)
+
+    def enabled_stages(self) -> list:
+        return [s for s in self.stages if s.enabled]
+
+    def to_dict(self) -> dict:
+        return {"name": self.name,
+                "stages": [s.to_dict() for s in self.stages]}
+
+    @staticmethod
+    def from_dict(d: dict) -> "FilterBank":
+        return FilterBank(
+            name=str(d.get("name", "bank")),
+            stages=[FilterStage.from_dict(s) for s in d.get("stages", [])],
+        )
+
 
 def _bandpass_sos(low: float, high: float, fs: float, order: int = 4):
     nyq = 0.5 * fs
@@ -42,6 +131,30 @@ def _notch_sos(freq: float, fs: float, q: float = 30.0):
     return tf2sos(b, a)
 
 
+def _stage_sos(stage: FilterStage, fs: float):
+    """Compile one FilterStage into an SOS array. Raises ValueError if invalid."""
+    nyq = 0.5 * fs
+    if stage.kind == "bandpass":
+        if not (0.01 <= stage.low < stage.high < nyq):
+            raise ValueError(
+                f"Invalid bandpass {stage.low:g}–{stage.high:g} Hz (Nyquist {nyq:g})")
+        return butter(4, [stage.low / nyq, stage.high / nyq], btype="band",
+                      output="sos")
+    if stage.kind == "highpass":
+        if not (0.01 <= stage.low < nyq):
+            raise ValueError(f"Invalid highpass {stage.low:g} Hz (Nyquist {nyq:g})")
+        return butter(4, stage.low / nyq, btype="high", output="sos")
+    if stage.kind == "lowpass":
+        if not (0.01 <= stage.high < nyq):
+            raise ValueError(f"Invalid lowpass {stage.high:g} Hz (Nyquist {nyq:g})")
+        return butter(4, stage.high / nyq, btype="low", output="sos")
+    if stage.kind == "notch":
+        if not (0.01 <= stage.freq < nyq):
+            raise ValueError(f"Invalid notch {stage.freq:g} Hz (Nyquist {nyq:g})")
+        return _notch_sos(stage.freq, fs)
+    raise ValueError(f"Unknown stage kind: {stage.kind}")
+
+
 class EEGProcessor:
     """
     Stateless filter application + stateful metric history.
@@ -53,12 +166,21 @@ class EEGProcessor:
     """
 
     def __init__(self, sample_rate: float = SAMPLE_RATE, notch_freq: float = 50.0):
-        self.fs              = sample_rate
-        self.filter_low      = 0.5
-        self.filter_high     = 45.0
-        self.notch_freq      = notch_freq
-        self.filters_enabled = True
-        self._rebuild_filters()
+        self.fs          = sample_rate
+        self.notch_freq  = notch_freq      # line-noise reference for channel_stats
+        self._banks: dict[str, FilterBank] = {}
+        self.active_bank = "Cleaning"
+        self._bank_sos: dict[str, list] = {}
+
+        # Default bank preserves the historical 0.5–45 Hz BP + notch behaviour
+        self._banks[self.active_bank] = FilterBank(
+            self.active_bank,
+            stages=[
+                FilterStage("bandpass", low=0.5, high=45.0),
+                FilterStage("notch", freq=self.notch_freq),
+            ],
+        )
+        self._rebuild_bank(self.active_bank)
 
         # Rolling metric history  {metric_name: deque of (time, value)}
         _metrics = ("workload", "fatigue", "stress", "attention", "faa")
@@ -72,75 +194,171 @@ class EEGProcessor:
         # EMA smoothing state
         self._ema_state: dict[str, float] = {}
 
-    # ── Filtering ───────────────────────────────────────────────────────────────
+    # ── Filter banks ─────────────────────────────────────────────────────────────
 
-    def _rebuild_filters(self):
-        self._bp_sos    = _bandpass_sos(self.filter_low, self.filter_high, self.fs)
-        self._notch_sos = _notch_sos(self.notch_freq, self.fs)
+    @property
+    def banks(self) -> dict[str, FilterBank]:
+        return self._banks
+
+    @property
+    def filters_enabled(self) -> bool:
+        return bool(self._banks[self.active_bank].enabled_stages())
+
+    # Legacy scalar accessors (first bandpass / notch of active bank) so older
+    # callers and meta dicts keep working.
+    @property
+    def filter_low(self) -> float:
+        for s in self._banks[self.active_bank].stages:
+            if s.kind == "bandpass":
+                return s.low
+        return 0.5
+
+    @property
+    def filter_high(self) -> float:
+        for s in self._banks[self.active_bank].stages:
+            if s.kind == "bandpass":
+                return s.high
+        return 45.0
+
+    def _rebuild_bank(self, name: str):
+        """Compile SOS for every enabled stage of a bank; sync notch_freq."""
+        bank = self._banks[name]
+        self._bank_sos[name] = [
+            _stage_sos(s, self.fs) for s in bank.enabled_stages()
+        ]
+        if name == self.active_bank:
+            for s in bank.stages:
+                if s.kind == "notch" and s.enabled:
+                    self.notch_freq = s.freq
+                    break
+
+    def bank_names(self) -> list[str]:
+        return list(self._banks.keys())
+
+    def set_active_bank(self, name: str):
+        if name not in self._banks:
+            raise KeyError(f"Unknown filter bank: {name}")
+        self.active_bank = name
+        self._rebuild_bank(name)
+
+    def add_bank(self, name: str, stages: list | None = None) -> FilterBank:
+        if name in self._banks:
+            raise ValueError(f"Bank '{name}' already exists")
+        bank = FilterBank(name, stages=list(stages) if stages else [])
+        self._banks[name] = bank
+        self._rebuild_bank(name)
+        return bank
+
+    def duplicate_bank(self, name: str, new_name: str | None = None) -> FilterBank:
+        src = self._banks[name]
+        new_name = new_name or f"{name} copy"
+        bank = FilterBank(new_name,
+                          stages=[FilterStage(**vars(s)) for s in src.stages])
+        self._banks[new_name] = bank
+        self._rebuild_bank(new_name)
+        return bank
+
+    def update_bank(self, name: str, stages: list):
+        self._banks[name].stages = list(stages)
+        self._rebuild_bank(name)
+
+    def remove_bank(self, name: str):
+        if name == self.active_bank:
+            raise ValueError("Cannot remove the active bank")
+        del self._banks[name]
+        self._bank_sos.pop(name, None)
+
+    def bank_to_dicts(self) -> list[dict]:
+        return [b.to_dict() for b in self._banks.values()]
+
+    def load_banks(self, bank_dicts: list[dict], active: str | None):
+        """Replace all banks from serialized dicts (settings restore)."""
+        self._banks = {}
+        self._bank_sos = {}
+        for d in bank_dicts:
+            bank = FilterBank.from_dict(d)
+            self._banks[bank.name] = bank
+        if not self._banks:
+            self._banks["Cleaning"] = FilterBank(
+                "Cleaning",
+                [FilterStage("bandpass", 0.5, 45.0),
+                 FilterStage("notch", freq=self.notch_freq)])
+        self.active_bank = active if active in self._banks else next(iter(self._banks))
+        for name in self._banks:
+            self._rebuild_bank(name)
 
     def configure_filters(self, low_hz: float | None = None,
                           high_hz: float | None = None,
                           notch_hz: float | None = None,
                           enabled: bool | None = None):
         """
-        Update real-time filter parameters (bandpass low/high cutoff, notch freq,
-        master enable).  Callers must reset causal filter states afterwards.
-        Raises ValueError on an invalid band.
+        Legacy convenience: rewrite the active bank as bandpass+notch.
+        Prefer editing banks via the filter dialog.
         """
+        bank = self._banks[self.active_bank]
         low   = self.filter_low  if low_hz   is None else float(low_hz)
         high  = self.filter_high if high_hz  is None else float(high_hz)
         notch = self.notch_freq  if notch_hz is None else float(notch_hz)
-        nyq   = self.fs / 2.0
-        if not (0.01 <= low < high < nyq):
-            raise ValueError(
-                f"Invalid band {low:g}–{high:g} Hz (Nyquist {nyq:g} Hz)"
-            )
-        self.filter_low, self.filter_high, self.notch_freq = low, high, notch
-        if enabled is not None:
-            self.filters_enabled = bool(enabled)
-        self._rebuild_filters()
+        bank.stages = [
+            FilterStage("bandpass", low=low, high=high, enabled=bool(enabled)),
+            FilterStage("notch", freq=notch, enabled=bool(enabled)),
+        ]
+        self._rebuild_bank(self.active_bank)
 
-    def filter_signal(self, data: np.ndarray) -> np.ndarray:
+    # ── Filtering ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _apply_stages(data: np.ndarray, sos_list: list,
+                      causal: bool = False, states: dict | None = None):
+        """Run an (n,ch) array through a list of SOS filters."""
+        y = data
+        if causal:
+            for i, sos in enumerate(sos_list):
+                y, zi = sosfilt(sos, y, axis=0, zi=states[str(i)])
+                states[str(i)] = zi
+            return y
+        for sos in sos_list:
+            y = sosfiltfilt(sos, y, axis=0)
+        return y
+
+    def filter_signal(self, data: np.ndarray,
+                      bank: str | None = None) -> np.ndarray:
         """
-        Apply bandpass + notch filter to a (n_samples, n_channels) array.
-        Zero-phase (sosfiltfilt) — use for offline/epoch processing only.
+        Zero-phase (sosfiltfilt) filtering — offline/epoch processing only.
+        `bank` selects which bank to apply; default = active bank.
         """
-        if data.shape[0] < 10 or not self.filters_enabled:
+        name = bank or self.active_bank
+        sos_list = self._bank_sos.get(name, [])
+        if data.shape[0] < 10 or not sos_list:
             return data
-        filtered = sosfiltfilt(self._bp_sos,   data, axis=0)
-        filtered = sosfiltfilt(self._notch_sos, filtered, axis=0)
-        return filtered
+        return self._apply_stages(data, sos_list)
+
+    def filter_all_banks(self, data: np.ndarray) -> dict[str, np.ndarray]:
+        """Return {bank_name: filtered_data} for every bank with ≥1 stage."""
+        out = {}
+        for name, bank in self._banks.items():
+            if bank.enabled_stages():
+                out[name] = self.filter_signal(data, bank=name)
+        return out
 
     def make_filter_states(self, n_channels: int) -> dict:
-        """Create zero initial causal filter states for n_channels."""
-        zi_bp    = sosfilt_zi(self._bp_sos)
-        zi_notch = sosfilt_zi(self._notch_sos)
-        return {
-            "bp":    np.zeros((zi_bp.shape[0],    2, n_channels)),
-            "notch": np.zeros((zi_notch.shape[0], 2, n_channels)),
-        }
+        """Zero causal states for the ACTIVE bank's enabled stages."""
+        states = {}
+        for i, sos in enumerate(self._bank_sos.get(self.active_bank, [])):
+            zi = sosfilt_zi(sos)
+            states[str(i)] = np.zeros((zi.shape[0], 2, n_channels))
+        return states
 
-    def filter_new(self, data: np.ndarray, states: dict) -> tuple[np.ndarray, dict]:
+    def filter_new(self, data: np.ndarray, states: dict
+                   ) -> tuple[np.ndarray, dict]:
         """
-        Causal online filter — processes only new samples, preserves filter memory.
-
-        Parameters
-        ----------
-        data   : (n_new_samples, n_channels)
-        states : dict with keys "bp" and "notch" (from make_filter_states)
-
-        Returns
-        -------
-        filtered : (n_new_samples, n_channels)
-        states   : updated states (mutated in-place and returned)
+        Causal online filter on the ACTIVE bank — preserves stage memory.
+        `states` keys are stage indices as strings (from make_filter_states).
         """
-        if data.shape[0] == 0 or not self.filters_enabled:
+        sos_list = self._bank_sos.get(self.active_bank, [])
+        if data.shape[0] == 0 or not sos_list:
             return data, states
-        y, zi_bp    = sosfilt(self._bp_sos,    data, axis=0, zi=states["bp"])
-        y, zi_notch = sosfilt(self._notch_sos, y,    axis=0, zi=states["notch"])
-        states["bp"]    = zi_bp
-        states["notch"] = zi_notch
-        return y, states
+        return self._apply_stages(data, sos_list, causal=True, states=states), states
 
     # ── Band power ──────────────────────────────────────────────────────────────
 

@@ -39,7 +39,21 @@ QUALITY_COLORS = {
 }
 
 # ── Dark QSS stylesheet ────────────────────────────────────────────────────────
-DARK_QSS = """
+import re
+
+
+def build_stylesheet(scale: float = 1.0) -> str:
+    """Return DARK_QSS with all font-size px values multiplied by `scale`."""
+    if scale == 1.0:
+        return _DARK_QSS_TEMPLATE
+    return re.sub(
+        r"font-size:\s*(\d+(?:\.\d+)?)px",
+        lambda m: f"font-size: {float(m.group(1)) * scale:g}px",
+        _DARK_QSS_TEMPLATE,
+    )
+
+
+_DARK_QSS_TEMPLATE = """
 QMainWindow, QWidget {
     background-color: #1a1a2e;
     color: #e0e0e0;
@@ -220,3 +234,5 @@ QGroupBox::title {
     padding: 0 4px;
 }
 """
+
+DARK_QSS = build_stylesheet(1.0)

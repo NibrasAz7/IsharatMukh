@@ -7,16 +7,17 @@ import threading
 import time
 import traceback
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox,
-    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
-    QMainWindow, QProgressBar, QPushButton, QScrollArea, QSplitter,
-    QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout,
+    QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+    QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from src.gui.bands_panel import BandsPanel
@@ -25,11 +26,15 @@ from src.gui.mental_panel import MentalPanel
 from src.gui.ppg_panel import PPGPanel, compute_hr_hrv
 from src.gui.theme import (
     CH_NAMES, ERASER_WIDTH, QUALITY_COLORS, SWEEP_SIZE, SWEEP_WINDOW_S,
+    build_stylesheet,
 )
 from src.processing import BANDS, EEGProcessor
+from src.recorder import SessionRecorder
+from src.settings import banks_from_settings, load_settings, save_settings
 from src.stream_reader import StreamReader
 
 _N_CH = 5
+APP_VERSION = "0.2.0-alpha"
 
 
 class MainWindow(QMainWindow):
@@ -37,11 +42,17 @@ class MainWindow(QMainWindow):
     _scan_done      = pyqtSignal(list)         # scan results (final list)
     _scan_live      = pyqtSignal(list)         # live discoveries during scan
     _connect_result = pyqtSignal(bool, str)    # (success, error_msg) from BLE thread
+    _bt_probe       = pyqtSignal(str)          # bluetooth availability probe
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("IsharatMukh — EEG Dashboard")
         self.resize(1400, 820)
+
+        # ── Persistent settings ──────────────────────────────────────────────
+        self._settings  = load_settings()
+        self._ui_scale  = float(self._settings.get("ui_scale", 1.0))
+        self._thr       = dict(self._settings.get("metric_thresholds", {}))
 
         # ── Backend singletons ────────────────────────────────────────────────
         self._ble_reader = StreamReader()
@@ -50,6 +61,12 @@ class MainWindow(QMainWindow):
         self._lsl_pub    = None                # LSLOutlet when enabled
         self._lsl_push_seen = 0                # cursor for LSL-outlet pushing
         self._processor  = EEGProcessor(notch_freq=50.0)
+        _banks, _active = banks_from_settings(self._settings)
+        if _banks:
+            try:
+                self._processor.load_banks(_banks, _active)
+            except Exception:
+                pass
 
         # ── Sweep state ───────────────────────────────────────────────────────
         self._y_sweep       = np.full((SWEEP_SIZE, _N_CH), np.nan)
@@ -64,9 +81,15 @@ class MainWindow(QMainWindow):
         # ── Recording state ───────────────────────────────────────────────────
         self._is_recording  = False
         self._record_start  = 0.0
+        self._session       = None          # finalized SessionRecorder result
+        self._recorder      = SessionRecorder()
+        self._rec_eeg_seen  = 0             # sample_count cursor while recording
+        self._rec_ppg_seen  = 0
+        self._bt_state      = None          # cached bluetooth probe result
 
         # ── Markers / triggers ────────────────────────────────────────────────
-        self._marker_defs:      list[str] = ["Start", "Rest", "Task", "End"]
+        self._marker_defs:      list[str] = list(
+            self._settings.get("marker_defs", ["Start", "Rest", "Task", "End"]))
         self._marker_events:    list[tuple[float, str]] = []
         self._marker_btns:      list[QPushButton] = []
         self._marker_shortcuts: list[QShortcut] = []
@@ -93,8 +116,12 @@ class MainWindow(QMainWindow):
         self._scan_done.connect(self._apply_scan_results)
         self._scan_live.connect(self._on_scan_live)
         self._connect_result.connect(self._on_connect_result)
+        self._bt_probe.connect(self._on_bt_probe)
         self._build_ui()
         self._build_timers()
+        self._mental_panel.set_thresholds(self._thr)
+        if self._ui_scale != 1.0:
+            self._apply_ui_scale(self._ui_scale)
 
     # ═════════════════════════════════════════════════════════════════════════
     # UI construction
@@ -108,12 +135,13 @@ class MainWindow(QMainWindow):
         root_h.setSpacing(4)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter = splitter
         _sb_scroll = QScrollArea()
         _sb_scroll.setWidget(self._build_sidebar())
         _sb_scroll.setWidgetResizable(True)
         _sb_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        _sb_scroll.setMinimumWidth(200)
-        _sb_scroll.setMaximumWidth(360)
+        _sb_scroll.setMinimumWidth(int(200 * self._ui_scale))
+        _sb_scroll.setMaximumWidth(int(380 * self._ui_scale))
         splitter.addWidget(_sb_scroll)
 
         # Main tab area
@@ -128,7 +156,8 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._ppg_panel,    "💓  PPG")
         splitter.addWidget(self._tabs)
 
-        splitter.setSizes([220, 1180])
+        splitter.setSizes([int(230 * self._ui_scale),
+                           int(1400 * self._ui_scale)])
         splitter.setCollapsible(0, False)
         root_h.addWidget(splitter)
 
@@ -224,7 +253,20 @@ class MainWindow(QMainWindow):
         btn_save_cfg.setToolTip("Configure save path, format and what to include")
         btn_save_cfg.clicked.connect(self._on_save_settings)
         save_row.addWidget(btn_save_cfg)
+        btn_app_cfg = QPushButton("🛠")
+        btn_app_cfg.setFixedWidth(30)
+        btn_app_cfg.setToolTip(
+            "App settings — UI scale, autosave, thresholds, filter banks")
+        btn_app_cfg.clicked.connect(self._on_app_settings)
+        save_row.addWidget(btn_app_cfg)
         rec_layout.addLayout(save_row)
+
+        self._btn_epochs = QPushButton("⇩  Extract epochs…")
+        self._btn_epochs.setToolTip(
+            "Re-read a saved session_X_data.csv and write its "
+            "above-threshold epoch table")
+        self._btn_epochs.clicked.connect(self._on_extract_epochs)
+        rec_layout.addWidget(self._btn_epochs)
 
         self._btn_clear = QPushButton("🗑️  Clear Data")
         self._btn_clear.setEnabled(False)
@@ -256,16 +298,11 @@ class MainWindow(QMainWindow):
         marker_layout.addLayout(self._marker_grid)
 
         mk_row = QHBoxLayout()
-        btn_add_mk = QPushButton("+ Add")
-        btn_add_mk.setFixedHeight(24)
-        btn_add_mk.setToolTip("Define a new marker button")
-        btn_add_mk.clicked.connect(self._on_add_marker)
-        mk_row.addWidget(btn_add_mk)
-        btn_del_mk = QPushButton("− Remove")
-        btn_del_mk.setFixedHeight(24)
-        btn_del_mk.setToolTip("Remove a marker button")
-        btn_del_mk.clicked.connect(self._on_remove_marker)
-        mk_row.addWidget(btn_del_mk)
+        btn_edit_mk = QPushButton("✎  Edit markers…")
+        btn_edit_mk.setToolTip(
+            "Rename/reorder marker buttons and edit fired events")
+        btn_edit_mk.clicked.connect(self._on_edit_markers)
+        mk_row.addWidget(btn_edit_mk)
         marker_layout.addLayout(mk_row)
 
         self._marker_status = QLabel("Markers saved with session data\n(also keys 1–9)")
@@ -276,43 +313,27 @@ class MainWindow(QMainWindow):
         layout.addWidget(marker_group)
         self._rebuild_marker_buttons()
 
-        # ── Settings group ────────────────────────────────────────────────────
+        # ── Filter banks group ────────────────────────────────────────────────
         settings_group = QGroupBox("Filters")
         settings_layout = QVBoxLayout(settings_group)
         settings_layout.setSpacing(6)
 
-        self._flt_enable = QCheckBox("Enable real-time filters")
-        self._flt_enable.setChecked(True)
-        self._flt_enable.toggled.connect(self._apply_filter_settings)
-        settings_layout.addWidget(self._flt_enable)
+        bank_row = QHBoxLayout()
+        bank_row.addWidget(QLabel("Active bank:"))
+        self._bank_combo = QComboBox()
+        self._bank_combo.currentTextChanged.connect(self._on_bank_changed)
+        bank_row.addWidget(self._bank_combo, stretch=1)
+        btn_banks = QPushButton("Manage…")
+        btn_banks.setToolTip("Add/edit/reorder filter banks and stages")
+        btn_banks.clicked.connect(self._on_manage_banks)
+        bank_row.addWidget(btn_banks)
+        settings_layout.addLayout(bank_row)
 
-        bp_row = QHBoxLayout()
-        bp_row.addWidget(QLabel("Bandpass:"))
-        self._flt_low = QDoubleSpinBox()
-        self._flt_low.setRange(0.1, 100.0)
-        self._flt_low.setSingleStep(0.5)
-        self._flt_low.setDecimals(1)
-        self._flt_low.setValue(0.5)
-        self._flt_low.setSuffix(" Hz")
-        self._flt_low.valueChanged.connect(self._apply_filter_settings)
-        bp_row.addWidget(self._flt_low)
-        self._flt_high = QDoubleSpinBox()
-        self._flt_high.setRange(1.0, 120.0)
-        self._flt_high.setSingleStep(1.0)
-        self._flt_high.setDecimals(1)
-        self._flt_high.setValue(45.0)
-        self._flt_high.setSuffix(" Hz")
-        self._flt_high.valueChanged.connect(self._apply_filter_settings)
-        bp_row.addWidget(self._flt_high)
-        settings_layout.addLayout(bp_row)
-
-        notch_row = QHBoxLayout()
-        notch_row.addWidget(QLabel("Notch filter:"))
-        self._notch_combo = QComboBox()
-        self._notch_combo.addItems(["50 Hz", "60 Hz"])
-        self._notch_combo.currentIndexChanged.connect(self._apply_filter_settings)
-        notch_row.addWidget(self._notch_combo)
-        settings_layout.addLayout(notch_row)
+        self._bank_summary = QLabel("")
+        self._bank_summary.setStyleSheet("color: #88aaff; font-size: 11px;")
+        self._bank_summary.setWordWrap(True)
+        settings_layout.addWidget(self._bank_summary)
+        self._refresh_bank_ui()
 
         layout.addWidget(settings_group)
 
@@ -356,6 +377,12 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
     def _do_update_fast(self):
+        # Accumulate session data independently of the 60 s display buffer
+        if self._is_recording:
+            chunk, cts = self._reader.get_new_samples(self._rec_eeg_seen)
+            self._rec_eeg_seen += chunk.shape[0]
+            self._recorder.append_eeg(chunk, cts)
+
         # Re-broadcast new raw samples to the LSL outlet, if enabled
         if self._lsl_pub is not None:
             chunk, _ = self._reader.get_new_samples(self._lsl_push_seen)
@@ -583,8 +610,41 @@ class MainWindow(QMainWindow):
             self._btn_connect.setEnabled(True)
             self._btn_connect.setText("▶  Connect")
             self._set_status(f"● ERR: {err[:30]}", "#cc3333")
+            if self._source_combo.currentIndex() == 0:
+                self._check_bluetooth()
+
+    def _check_bluetooth(self):
+        """Probe once whether a Bluetooth adapter/service exists; warn if off."""
+        if self._bt_state is not None:
+            return
+        def _probe():
+            try:
+                import subprocess
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "$d = Get-PnpDevice -Class Bluetooth -ErrorAction "
+                     "SilentlyContinue; $s = (Get-Service bthserv "
+                     "-ErrorAction SilentlyContinue).Status; "
+                     "if ($d -and $s -eq 'Running') {'OK'} else {'OFF'}"],
+                    capture_output=True, text=True, timeout=10)
+                self._bt_probe.emit(r.stdout.strip() or "UNKNOWN")
+            except Exception:
+                self._bt_probe.emit("UNKNOWN")
+        threading.Thread(target=_probe, daemon=True,
+                         name="bt-probe").start()
+
+    def _on_bt_probe(self, state: str):
+        self._bt_state = state
+        if state == "OFF":
+            QMessageBox.warning(
+                self, "Bluetooth unavailable",
+                "Bluetooth appears to be turned off or has no adapter.\n\n"
+                "Enable it in Windows Settings → Bluetooth (and make sure the "
+                "PC's Bluetooth radio is on), then try connecting again.")
 
     def _on_connected(self):
+        # New connection → previous session result no longer applies
+        self._session = None
         # Reset sweep state
         self._y_sweep[:] = np.nan
         self._write_idx  = 0
@@ -630,6 +690,13 @@ class MainWindow(QMainWindow):
         ppg_idx = self._tabs.indexOf(self._ppg_panel)
         self._tabs.setTabEnabled(ppg_idx, True)
         self._tabs.setTabText(ppg_idx, "💓  PPG")
+        if self._is_recording:
+            try:
+                self._recorder.stop_recording()
+                self._session = self._recorder.result()
+                self._auto_save()
+            except Exception:
+                traceback.print_exc()
         self._is_recording = False
         self._btn_record.setText("⏺  Start Recording")
         self._btn_record.setProperty("recording", "false")
@@ -649,6 +716,10 @@ class MainWindow(QMainWindow):
         if not self._is_recording:
             self._is_recording = True
             self._record_start = time.time()
+            self._session = None
+            self._recorder.start_recording()
+            self._rec_eeg_seen = self._reader.sample_count
+            self._rec_ppg_seen = self._reader.ppg_count
             self._btn_record.setText("⏹  Stop Recording")
             self._btn_record.setProperty("recording", "true")
             self._btn_record.style().unpolish(self._btn_record)
@@ -658,17 +729,35 @@ class MainWindow(QMainWindow):
         else:
             self._is_recording = False
             self._timer_rec.stop()
+            self._recorder.stop_recording()
+            self._session = self._recorder.result()
             self._btn_record.setText("⏺  Start Recording")
             self._btn_record.setProperty("recording", "false")
             self._btn_record.style().unpolish(self._btn_record)
             self._btn_record.style().polish(self._btn_record)
             self._btn_save.setEnabled(True)
+            self._auto_save()
 
     def _on_save_settings(self):
         from src.gui.save_dialog import SaveSettingsDialog
         dlg = SaveSettingsDialog(self._save_settings, parent=self)
         if dlg.exec():
             self._save_settings = dlg.settings
+
+    def _on_extract_epochs(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select session data CSV", "",
+            "Session data (*.csv);;All files (*)")
+        if not path or not path.endswith("_data.csv"):
+            return
+        try:
+            from src.epochs import epochs_from_csv
+            out = epochs_from_csv(
+                path, pad_s=float(self._settings.get("epoch_pad_s", 0.5)),
+                thresholds=self._thr)
+            self._save_status.setText(f"✓ Epochs → {out.name}")
+        except Exception as exc:
+            self._save_status.setText(f"⚠ Epoch extraction failed: {exc}")
 
     def _check_ppg_available(self):
         if self._reader.ppg_count == 0:
@@ -677,12 +766,46 @@ class MainWindow(QMainWindow):
             self._tabs.setTabText(idx, "💓  PPG (n/a)")
 
     def _on_save(self):
+        self._save_data(autosaved=False)
+
+    def _auto_save(self):
+        """Autosave the just-finished session if enabled in settings."""
+        if not self._settings.get("autosave", True):
+            return
+        sess = self._session
+        if sess is None or sess["eeg_data"].shape[0] == 0:
+            return
+        try:
+            self._save_data(autosaved=True)
+        except Exception as exc:
+            self._save_status.setText(f"⚠ Auto-save failed: {exc}")
+
+    def _save_data(self, autosaved: bool = False):
         from src.data_manager import save_recording
         s   = self._save_settings
         inc = s.get("include", {})
 
-        data, ts         = self._reader.get_all()
-        ppg_data, ppg_ts = self._reader.get_all_ppg()
+        # Prefer the session-side recording (full length); fall back to the
+        # 60 s display buffer when nothing was recorded this connection.
+        sess = self._session
+        if sess is not None and sess["eeg_data"].shape[0] > 0:
+            data, ts         = sess["eeg_data"], sess["eeg_ts"]
+            ppg_data, ppg_ts = sess["ppg_data"], sess["ppg_ts"]
+            t_lo = sess["start"] - 1.0
+            t_hi = (sess["stop"] or time.time()) + 1.0
+            rec_meta = {
+                "start":       datetime.fromtimestamp(sess["start"])
+                               .isoformat(timespec="seconds"),
+                "stop":        datetime.fromtimestamp(sess["stop"] or time.time())
+                               .isoformat(timespec="seconds"),
+                "duration_s":  round(sess["duration_s"], 1),
+                "autosaved":   autosaved,
+            }
+        else:
+            data, ts         = self._reader.get_all()
+            ppg_data, ppg_ts = self._reader.get_all_ppg()
+            t_lo = t_hi = None
+            rec_meta = None
 
         if data.shape[0] == 0 and ppg_data.shape[0] == 0:
             self._save_status.setText("⚠ No data to save.")
@@ -694,46 +817,65 @@ class MainWindow(QMainWindow):
         data_save  = data[:, sel]
         ch_names   = [CH_NAMES[i] for i in sel]
 
-        filtered_save = (
-            self._processor.filter_signal(data_save)
-            if inc.get("filtered", True) and self._processor.filters_enabled
-            else None
-        )
-        metric_h = (
-            {k: list(v) for k, v in self._processor.metric_history.items()}
-            if inc.get("mental", True) else None
-        )
+        # One filtered column set per filter bank (banks with ≥1 enabled stage)
+        filtered_banks = None
+        if inc.get("filtered", True):
+            filtered_banks = self._processor.filter_all_banks(data_save)
+            if not filtered_banks:
+                filtered_banks = None
+
+        metric_h = None
+        if inc.get("mental", True):
+            metric_h = {
+                k: [(t, v) for t, v in self._processor.metric_history[k]
+                    if t_lo is None or t_lo <= t <= t_hi]
+                for k in self._processor.metric_history
+            }
+            metric_h = {k: v for k, v in metric_h.items() if v} or None
+
+        # Markers: window to the session when we have one
+        marker_events = list(self._marker_events)
+        if t_lo is not None:
+            marker_events = [(t, l) for t, l in marker_events
+                             if t_lo <= t <= t_hi]
+
         ppg_ok = inc.get("ppg", True) and ppg_data.shape[0] > 0
 
         meta = {
+            "app": {"name": "IsharatMukh", "version": APP_VERSION},
             "session_source": "BLE" if self._reader is self._ble_reader else "LSL",
             "device_name":     self._reader.device_name,
             "device_address":  self._reader.device_address,
             "sample_rate_hz":  self._reader.sample_rate,
             "channels":        ch_names,
             "n_samples":       int(data_save.shape[0]),
-            "filters": {
-                "enabled":  self._processor.filters_enabled,
-                "low_hz":   self._processor.filter_low,
-                "high_hz":  self._processor.filter_high,
-                "notch_hz": self._processor.notch_freq,
+            "processing": {
+                "filter_banks":       self._processor.bank_to_dicts(),
+                "active_bank":        self._processor.active_bank,
+                "metric_thresholds":  self._thr,
+                "metric_epoch_s":     2.0,
+                "baseline_s":         30.0,
             },
-            "marker_events": [
-                {"t": t, "label": l} for t, l in self._marker_events
-            ],
-            "include": inc,
-            "formats": sorted(s.get("formats", [])),
+            "markers": {
+                "defs":   list(self._marker_defs),
+                "events": [{"t": t, "label": l} for t, l in marker_events],
+            },
+            "ui":        {"scale": self._ui_scale},
+            "autosave":  autosaved,
+            "include":   inc,
+            "formats":   sorted(s.get("formats", [])),
             "note": ("metric columns are sparse (values at ~2 s epochs, NaN "
                      "between). marker column holds trigger labels at the "
-                     "nearest sample."),
+                     "nearest sample. filt_<bank>_<CH> columns: one set per "
+                     "filter bank."),
         }
 
         saved = save_recording(
             ts, data_save,
-            filtered_data=filtered_save,
+            filtered_banks=filtered_banks,
             sample_rate=self._reader.sample_rate,
             metric_history=metric_h,
-            marker_events=(self._marker_events
+            marker_events=(marker_events
                            if inc.get("markers", True) else None),
             channel_names=ch_names,
             meta=meta,
@@ -742,10 +884,17 @@ class MainWindow(QMainWindow):
             save_path=s.get("path"),
             formats=s.get("formats", {"csv", "edf"}),
             threshold_flag=inc.get("threshold_flag", True),
+            thresholds=self._thr,
+            record_meta=rec_meta,
+            epoch_pad_s=float(self._settings.get("epoch_pad_s", 0.5)),
         )
         n_ppg = ppg_data.shape[0] if ppg_ok else 0
+        extra = ""
+        if "epochs" in saved:
+            extra = f"\nEpochs: {Path(saved['epochs']).name}"
+        prefix = "✓ Auto-saved" if autosaved else "✓ Saved"
         self._save_status.setText(
-            f"✓ Saved — EEG: {data_save.shape[0]}  PPG: {n_ppg}\n"
+            f"{prefix} — EEG: {data_save.shape[0]}  PPG: {n_ppg}{extra}\n"
             f"{saved.get('csv', '')}"
         )
 
@@ -761,6 +910,9 @@ class MainWindow(QMainWindow):
         self._filter_states = self._processor.make_filter_states(_N_CH)
         self._band_history  = {b: deque(maxlen=3600) for b in BANDS}
         self._marker_events.clear()
+        self._session       = None
+        self._recorder.start_recording()   # reset chunk lists; start unused
+        self._recorder.stop_recording()
         self._marker_status.setText("Markers saved with session data\n(also keys 1–9)")
         self._eeg_panel.reset()
         self._ppg_panel.reset()
@@ -796,23 +948,19 @@ class MainWindow(QMainWindow):
                 )
                 self._marker_shortcuts.append(sc)
 
-    def _on_add_marker(self):
-        label, ok = QInputDialog.getText(self, "Add marker", "Marker label:")
-        label = label.strip()
-        if ok and label and label not in self._marker_defs:
-            self._marker_defs.append(label)
+    def _on_edit_markers(self):
+        from src.gui.marker_dialog import MarkerDialog
+        dlg = MarkerDialog(self._marker_defs, self._marker_events, self)
+        if dlg.exec():
+            defs, events = dlg.result_data()
+            self._marker_defs = defs
+            self._marker_events = events
             self._rebuild_marker_buttons()
-
-    def _on_remove_marker(self):
-        if not self._marker_defs:
-            return
-        label, ok = QInputDialog.getItem(
-            self, "Remove marker", "Select marker to remove:",
-            self._marker_defs, 0, False,
-        )
-        if ok and label in self._marker_defs:
-            self._marker_defs.remove(label)
-            self._rebuild_marker_buttons()
+            self._settings["marker_defs"] = list(defs)
+            save_settings(self._settings)
+            self._marker_status.setText(
+                f"{len(defs)} marker(s), {len(events)} event(s) recorded\n"
+                "(also keys 1–9)")
 
     def _fire_marker(self, label: str):
         t = self._reader.now()
@@ -824,19 +972,79 @@ class MainWindow(QMainWindow):
         if self._lsl_pub is not None:
             self._lsl_pub.push_marker(label)
 
-    def _apply_filter_settings(self, *_args):
-        """Push current filter UI settings into the processor + reset states."""
+    def _refresh_bank_ui(self):
+        """Sync the bank combo + summary label with the processor."""
+        self._bank_combo.blockSignals(True)
+        self._bank_combo.clear()
+        self._bank_combo.addItems(self._processor.bank_names())
+        self._bank_combo.setCurrentText(self._processor.active_bank)
+        self._bank_combo.blockSignals(False)
+        bank = self._processor._banks.get(self._processor.active_bank)
+        if bank is not None and bank.stages:
+            desc = " → ".join(s.describe() for s in bank.stages)
+        else:
+            desc = "no stages (passthrough)"
+        self._bank_summary.setText(
+            f"{len(self._processor.bank_names())} bank(s) — "
+            f"{self._processor.active_bank}: {desc}")
+
+    def _on_bank_changed(self, name: str):
         try:
-            self._processor.configure_filters(
-                low_hz=self._flt_low.value(),
-                high_hz=self._flt_high.value(),
-                notch_hz=50.0 if self._notch_combo.currentIndex() == 0 else 60.0,
-                enabled=self._flt_enable.isChecked(),
-            )
-        except ValueError as exc:
-            self._save_status.setText(f"⚠ {exc}")
+            self._processor.set_active_bank(name)
+        except KeyError:
             return
         self._filter_states = self._processor.make_filter_states(_N_CH)
+        self._refresh_bank_ui()
+        self._settings["active_bank"] = name
+        save_settings(self._settings)
+
+    def _on_manage_banks(self):
+        from src.gui.filter_dialog import FilterBanksDialog
+        from src.processing import FilterBank, FilterStage
+        banks = [FilterBank(b.name, [FilterStage(**vars(s))
+                                     for s in b.stages])
+                 for b in self._processor.banks.values()]
+        dlg = FilterBanksDialog(banks, self._processor.active_bank, self)
+        if dlg.exec():
+            new_banks, active = dlg.result_banks()
+            try:
+                self._processor.load_banks(
+                    [b.to_dict() for b in new_banks], active)
+            except Exception as exc:
+                self._save_status.setText(f"⚠ Filter error: {exc}")
+                return
+            self._filter_states = self._processor.make_filter_states(_N_CH)
+            self._settings["filter_banks"] = self._processor.bank_to_dicts()
+            self._settings["active_bank"] = self._processor.active_bank
+            save_settings(self._settings)
+            self._refresh_bank_ui()
+
+    def _on_app_settings(self):
+        from src.gui.settings_dialog import SettingsDialog
+        dlg = SettingsDialog(self._settings, self._processor, self)
+        if dlg.exec():
+            self._settings = dlg.settings()
+            save_settings(self._settings)
+            self._apply_settings()
+
+    def _apply_settings(self):
+        """Push persisted settings into live state (after Settings dialog)."""
+        scale = float(self._settings.get("ui_scale", 1.0))
+        if scale != self._ui_scale:
+            self._apply_ui_scale(scale)
+        self._thr = dict(self._settings.get("metric_thresholds", {}))
+        self._mental_panel.set_thresholds(self._thr)
+        self._marker_defs = list(self._settings.get(
+            "marker_defs", self._marker_defs))
+        self._rebuild_marker_buttons()
+
+    def _apply_ui_scale(self, scale: float):
+        self._ui_scale = scale
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_stylesheet(scale))
+        self._splitter.setSizes([int(230 * scale), int(1400 * scale)])
+        self.resize(int(1440 * scale), int(860 * scale))
 
     def _update_rec_timer(self):
         if self._is_recording:
@@ -858,8 +1066,13 @@ class MainWindow(QMainWindow):
 
     def _update_ppg(self):
         try:
-            new_ppg, _ = self._reader.get_new_ppg_samples(self._ppg_last_seen)
+            new_ppg, pts = self._reader.get_new_ppg_samples(self._ppg_last_seen)
             self._ppg_last_seen += new_ppg.shape[0]
+            if self._is_recording:
+                pchunk, pcts = self._reader.get_new_ppg_samples(
+                    self._rec_ppg_seen)
+                self._rec_ppg_seen += pchunk.shape[0]
+                self._recorder.append_ppg(pchunk, pcts)
             ppg_win, _ = self._reader.get_ppg_window(seconds=10)
             self._ppg_panel.refresh_sweep(ppg_win)
         except Exception:
@@ -878,6 +1091,15 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
     def closeEvent(self, event):
+        # Don't lose an in-progress recording on window close
+        if self._is_recording:
+            try:
+                self._recorder.stop_recording()
+                self._session = self._recorder.result()
+                self._is_recording = False
+                self._auto_save()
+            except Exception:
+                traceback.print_exc()
         self._timer_fast.stop()
         self._timer_slow.stop()
         self._timer_ppg.stop()
